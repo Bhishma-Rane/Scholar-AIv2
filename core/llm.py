@@ -41,6 +41,10 @@ def search_images(query: str, max_results: int = 4) -> list:
         return []
 
 
+from config import OLLAMA_MAIN_MODEL, OLLAMA_BASE_URL
+
+# ... (search_images, internet_search unchanged) ...
+
 def get_llm(model_type: str = "main"):
     """
     Fix Issue #38: Lazy load LLMs to prevent startup crashes if Ollama is down.
@@ -53,6 +57,7 @@ def get_llm(model_type: str = "main"):
         if model_type == "quiz":
             return ChatOllama(
                 model=OLLAMA_MAIN_MODEL,
+                base_url=OLLAMA_BASE_URL,
                 temperature=0.1,
                 top_p=0.2,
                 num_ctx=8192,
@@ -60,6 +65,7 @@ def get_llm(model_type: str = "main"):
             )
         return ChatOllama(
             model=OLLAMA_MAIN_MODEL,
+            base_url=OLLAMA_BASE_URL,
             temperature=0.1,
             top_p=0.2,
             num_ctx=8192,
