@@ -1,0 +1,12 @@
+streamlit
+langchain-core
+langchain-community
+langchain-ollama
+langchain-text-splitters
+langgraph
+duckduckgo-search
+ddgs
+chromadb
+pypdf
+fpdf2
+pandas
