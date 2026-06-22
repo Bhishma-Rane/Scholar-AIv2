@@ -46,30 +46,17 @@ from config import OLLAMA_MAIN_MODEL, OLLAMA_BASE_URL
 # ... (search_images, internet_search unchanged) ...
 
 def get_llm(model_type: str = "main"):
-    """
-    Fix Issue #38: Lazy load LLMs to prevent startup crashes if Ollama is down.
-
-    model_type:
-        "main" -> general chat / generation model
-        "quiz" -> tuned for longer, structured JSON output (quizzes/exams)
-    """
     try:
-        if model_type == "quiz":
-            return ChatOllama(
-                model=OLLAMA_MAIN_MODEL,
-                base_url=OLLAMA_BASE_URL,
-                temperature=0.1,
-                top_p=0.2,
-                num_ctx=8192,
-                num_predict=2048,
-            )
-        return ChatOllama(
+        common_kwargs = dict(
             model=OLLAMA_MAIN_MODEL,
             base_url=OLLAMA_BASE_URL,
             temperature=0.1,
             top_p=0.2,
-            num_ctx=8192,
+            client_kwargs={"headers": {"ngrok-skip-browser-warning": "true"}},
         )
+        if model_type == "quiz":
+            return ChatOllama(**common_kwargs, num_ctx=8192, num_predict=2048)
+        return ChatOllama(**common_kwargs, num_ctx=8192)
     except Exception as e:
         print(f"Error connecting to Ollama: {e}")
         return None
