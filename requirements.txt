@@ -10,3 +10,4 @@ chromadb
 pypdf
 fpdf2
 pandas
+protobuf<=3.20.3
