@@ -30,8 +30,7 @@ MATERIAL_TYPES = ["Study Roadmap", "One-Page Summary", "Exam Cheat Sheet", "Key 
 
 OLLAMA_MAIN_MODEL = "llama3"
 OLLAMA_EMBED_MODEL = "nomic-embed-text"
-OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-
+OLLAMA_BASE_URL = st.secrets.get("OLLAMA_BASE_URL", os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"))
 
 # Auth
 MIN_PASSWORD_LENGTH = 8
