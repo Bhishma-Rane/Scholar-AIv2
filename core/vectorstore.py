@@ -12,7 +12,7 @@ from langchain_ollama import OllamaEmbeddings
 from langchain_community.document_loaders import DirectoryLoader, TextLoader, PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-from config import OLLAMA_EMBED_MODEL
+from config import OLLAMA_EMBED_MODEL, OLLAMA_BASE_URL
 from core.paths import get_user_paths, sanitize_filename
 
 
@@ -25,7 +25,11 @@ def get_vector_store(username: str, subject: str, force_rebuild: bool = False):
     """
     paths = get_user_paths(username, subject)
     chroma_db_dir = paths["chroma"]
-    embeddings = OllamaEmbeddings(model=OLLAMA_EMBED_MODEL)
+    embeddings = OllamaEmbeddings(
+    model=OLLAMA_EMBED_MODEL,
+    base_url=OLLAMA_BASE_URL,
+    client_kwargs={"headers": {"ngrok-skip-browser-warning": "true"}},
+    )
 
     if force_rebuild and os.path.exists(chroma_db_dir):
         shutil.rmtree(chroma_db_dir)
