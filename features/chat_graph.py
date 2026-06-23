@@ -174,11 +174,8 @@ def generate_standard_modes(state: AgentState):
 def generate_dynamic_quiz_files(state: AgentState):
     """
     Handles the 'ver <chapter> ! quiz <N>' command, writing a JSON quiz file
-    to disk. Generates in small batches and keeps requesting more until the
-    exact requested count is reached (the local LLM reliably undershoots
-    "generate exactly N" on a single call, especially for N > ~5).
+    to disk. Optimized for llama 3 on M5 with larger batches.
     """
-    # Fix Issue #8 & 25: Safe regex matching.
     match = re.search(r"ver\s+(.+?)\s+!\s+quiz", state["question"], re.IGNORECASE)
     safe_verse = match.group(1).strip() if match else "Generated"
 
@@ -203,13 +200,15 @@ FORMAT MUST BE EXACTLY THIS JSON, NOTHING ELSE — no markdown fences, no preamb
     all_questions = []
     seen_question_texts = set()
     attempts = 0
-    max_attempts = target_count + 8  # generous ceiling so a few bad batches don't loop forever
+    max_attempts = target_count + 3
 
     try:
         while len(all_questions) < target_count and attempts < max_attempts:
             attempts += 1
             remaining = target_count - len(all_questions)
-            batch_request = min(remaining, 5)  # small batches generate far more reliably than large ones
+            
+            # llama 3 on M5: batch size 15 for efficiency, smaller for final batch
+            batch_request = min(remaining, 15)
 
             quiz_inst = quiz_inst_template.format(n=batch_request, lang=lang)
             raw_out = quiz_llm.invoke(f"{quiz_inst}\n\nContext:\n{context}").content
@@ -218,7 +217,7 @@ FORMAT MUST BE EXACTLY THIS JSON, NOTHING ELSE — no markdown fences, no preamb
                 json_str = extract_clean_json(raw_out)
                 batch = json.loads(json_str)
             except Exception:
-                continue  # malformed batch, just retry the loop
+                continue
 
             if not isinstance(batch, list):
                 continue
@@ -227,7 +226,7 @@ FORMAT MUST BE EXACTLY THIS JSON, NOTHING ELSE — no markdown fences, no preamb
                 if not all(k in q for k in ["q", "answer", "type"]):
                     continue
                 if q["q"] in seen_question_texts:
-                    continue  # avoid duplicate questions across batches
+                    continue
                 q.setdefault("topic", safe_verse)
                 q.setdefault("marks", 1)
                 seen_question_texts.add(q["q"])
