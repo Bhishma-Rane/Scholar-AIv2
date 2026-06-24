@@ -28,20 +28,22 @@ _ASSESSMENT_CSS = """
 <style>
 /* Question text (rendered via st.subheader inside the question screen) */
 div[data-testid="stSubheader"] p,
-div[data-testid="stSubheader"] {
+div[data-testid="stSubheader"],
+div[data-testid="stSubheader"] h3 {
     font-size: 1.25rem !important;
     line-height: 1.5 !important;
+    font-weight: 400 !important;
 }
 
 /* Radio button option labels (the MCQ choices) */
 div[data-testid="stRadio"] label p {
-    font-size: 1.05rem !important;
+    font-size: 1.15rem !important;
     line-height: 1.5 !important;
 }
 
 /* Text area for subjective/short-answer questions, for consistency */
 div[data-testid="stTextArea"] textarea {
-    font-size: 1.05rem !important;
+    font-size: 1.15rem !important;
 }
 </style>
 """
