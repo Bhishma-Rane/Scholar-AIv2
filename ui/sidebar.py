@@ -6,17 +6,33 @@ workspace management (create/upload/delete), data source, and language.
 
 Returns a small dict of selections (active_subject, active_chapter,
 data_source, target_language) that the rest of the UI needs.
+
+CHANGED: subject creation, file upload, file listing, and delete all
+go through the storage bridge now (core/paths.py's bridge-backed
+helpers) instead of local disk — so subjects and uploaded PDFs survive
+a Streamlit Cloud container restart. Logout now calls ui.auth.logout()
+so the bridge-issued auto-login token gets revoked, instead of just
+clearing session_state (which would leave a stale token in the URL
+that silently logs the user back in).
 """
-import os
 import base64
-import shutil
 
 import streamlit as st
 
 from config import DATA_SOURCES, LANGUAGES
-from core.paths import get_user_paths, sanitize_filename
+from core.paths import (
+    get_user_paths,
+    sanitize_filename,
+    list_subjects,
+    create_subject,
+    list_subject_files,
+    upload_subject_file,
+    delete_subject_file,
+)
+from core.bridge_client import BridgeUnavailableError, is_bridge_reachable
 from core.vectorstore import get_vector_store
 from core.onboarding_store import reset_tutorial
+from ui.auth import logout as auth_logout
 
 
 def _render_focus_timer(timer_mins: int):
@@ -47,12 +63,18 @@ def render_sidebar(username: str, user_paths: dict) -> dict:
         st.title("🎓 ScholarAI")
         st.caption("*Learn. Understand. Master.*")
         st.caption(f"👤 Profile: **{username.capitalize()}**")
+
+        if not is_bridge_reachable():
+            st.warning(
+                "⚠️ Storage bridge unreachable — subjects/files may not load or save. "
+                "Check that the bridge server and its ngrok tunnel are running.",
+                icon="⚠️",
+            )
+
         col_logout, col_tutorial = st.columns(2)
         with col_logout:
             if st.button("🚪 Logout", use_container_width=True):
-                # Fix Issue #2: Safe dictionary deletion.
-                for key in list(st.session_state.keys()):
-                    del st.session_state[key]
+                auth_logout()
                 st.rerun()
         with col_tutorial:
             if st.button("❓ Replay Tutorial", use_container_width=True):
@@ -69,9 +91,11 @@ def render_sidebar(username: str, user_paths: dict) -> dict:
         st.markdown("---")
         st.subheader("📁 Subject Workspace")
 
-        existing_subjects = [
-            d for d in os.listdir(user_paths["sources"]) if os.path.isdir(os.path.join(user_paths["sources"], d))
-        ]
+        try:
+            existing_subjects = list_subjects(username)
+        except BridgeUnavailableError:
+            existing_subjects = []
+            st.error("Could not load subjects — storage bridge is unreachable.")
 
         # Fix Issue #13: Infinite rerun loop solved using a Form.
         with st.form("new_subject_form", clear_on_submit=True):
@@ -79,15 +103,23 @@ def render_sidebar(username: str, user_paths: dict) -> dict:
             if st.form_submit_button("Create"):
                 if new_subject.strip():
                     clean_sub = sanitize_filename(new_subject)
-                    os.makedirs(os.path.join(user_paths["sources"], clean_sub), exist_ok=True)
-                    st.rerun()
+                    try:
+                        create_subject(username, clean_sub)
+                        st.rerun()
+                    except BridgeUnavailableError:
+                        st.error("Could not create subject — storage bridge is unreachable.")
 
         active_subject = st.selectbox("Select Subject", ["Select Subject"] + existing_subjects)
         active_chapter = "Select Chapter"
 
         if active_subject != "Select Subject":
-            subj_path = os.path.join(user_paths["sources"], active_subject)
-            files = [f.rsplit(".", 1)[0] for f in os.listdir(subj_path) if f.endswith((".txt", ".pdf"))]
+            try:
+                subject_files = list_subject_files(username, active_subject)
+            except BridgeUnavailableError:
+                subject_files = []
+                st.error("Could not load files for this subject — storage bridge is unreachable.")
+
+            files = [f.rsplit(".", 1)[0] for f in subject_files if f.endswith((".txt", ".pdf"))]
             active_chapter = st.selectbox("Active Chapter", ["Select Chapter"] + sorted(files))
 
             # Fix Issue #14: File uploader state control.
@@ -95,31 +127,38 @@ def render_sidebar(username: str, user_paths: dict) -> dict:
                 uploaded_file = st.file_uploader("Upload PDF or TXT", type=["pdf", "txt"], label_visibility="collapsed")
                 if st.form_submit_button("Upload"):
                     if uploaded_file is not None:
-                        # Fix Issue #29: Safe filename.
-                        safe_name = (
-                            sanitize_filename(uploaded_file.name.rsplit(".", 1)[0])
-                            + "."
-                            + uploaded_file.name.rsplit(".", 1)[1]
-                        )
-                        with open(os.path.join(subj_path, safe_name), "wb") as f:
-                            f.write(uploaded_file.getbuffer())
-                        get_vector_store(username, active_subject, force_rebuild=True)
-                        st.success(f"Imported {safe_name}!")
-                        st.rerun()
+                        try:
+                            stored_name = upload_subject_file(
+                                username, active_subject, uploaded_file.name, uploaded_file.getbuffer().tobytes()
+                            )
+                            get_vector_store(username, active_subject, force_rebuild=True)
+                            st.success(f"Imported {stored_name}!")
+                            st.rerun()
+                        except BridgeUnavailableError:
+                            st.error("Upload failed — storage bridge is unreachable. Please try again shortly.")
 
             if active_chapter != "Select Chapter":
                 if st.button("🗑️ Delete Selected Chapter", type="secondary"):
-                    for ext in [".txt", ".pdf"]:
-                        tgt = os.path.join(subj_path, active_chapter + ext)
-                        if os.path.exists(tgt):
-                            os.remove(tgt)
-                    study_folder = os.path.join(user_paths["study"], active_subject, active_chapter)
-                    if os.path.exists(study_folder):
-                        shutil.rmtree(study_folder)
+                    try:
+                        for ext in [".txt", ".pdf"]:
+                            candidate = active_chapter + ext
+                            if candidate in subject_files:
+                                delete_subject_file(username, active_subject, candidate)
 
-                    # Fix Issue #37: Rebuild vector db when files are deleted.
-                    get_vector_store(username, active_subject, force_rebuild=True)
-                    st.rerun()
+                        # Locally-generated study content (quizzes, flashcards,
+                        # etc.) is still on local disk for now — see
+                        # core/paths.py module docstring for the follow-up.
+                        import os
+                        import shutil
+                        study_folder = os.path.join(user_paths["study"], active_subject, active_chapter)
+                        if os.path.exists(study_folder):
+                            shutil.rmtree(study_folder)
+
+                        # Fix Issue #37: Rebuild vector db when files are deleted.
+                        get_vector_store(username, active_subject, force_rebuild=True)
+                        st.rerun()
+                    except BridgeUnavailableError:
+                        st.error("Delete failed — storage bridge is unreachable. Please try again shortly.")
 
         st.markdown("---")
         data_source = st.radio("Data Source:", DATA_SOURCES)
