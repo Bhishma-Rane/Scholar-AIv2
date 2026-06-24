@@ -14,6 +14,11 @@ import streamlit as st
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 USERS_DIR = os.path.join(BASE_DIR, "users")
 os.makedirs(USERS_DIR, exist_ok=True)
+# NOTE: USERS_DIR is still used for local scratch space (e.g. the ChromaDB
+# that gets rebuilt fresh on every container start — see core/vectorstore.py).
+# It is intentionally NOT used anymore for anything that must survive a
+# restart: credentials, subjects, and uploaded PDFs all live on the
+# storage bridge now (see core/bridge_client.py).
 
 # ---------------------------------------------------------------------
 # ⚙️ APP CONSTANTS
@@ -32,6 +37,20 @@ OLLAMA_MAIN_MODEL = "llama3"
 OLLAMA_EMBED_MODEL = "nomic-embed-text"
 OLLAMA_BASE_URL = st.secrets.get("OLLAMA_BASE_URL", os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"))
 
+# ---------------------------------------------------------------------
+# 🌉 STORAGE BRIDGE (persistent storage on Bhishma's Windows laptop)
+# ---------------------------------------------------------------------
+# BRIDGE_BASE_URL: the ngrok static domain pointing at storage_bridge.py,
+# e.g. "https://your-static-bridge-domain.ngrok-free.app" — NO trailing slash.
+# BRIDGE_SHARED_SECRET: must exactly match the BRIDGE_SHARED_SECRET
+# environment variable set on the Windows laptop before starting the bridge.
+#
+# Set both in Streamlit Cloud's app settings -> Secrets, e.g.:
+#   BRIDGE_BASE_URL = "https://your-static-bridge-domain.ngrok-free.app"
+#   BRIDGE_SHARED_SECRET = "the-same-long-random-string-as-the-laptop"
+BRIDGE_BASE_URL = st.secrets.get("BRIDGE_BASE_URL", os.environ.get("BRIDGE_BASE_URL", "")).rstrip("/")
+BRIDGE_SHARED_SECRET = st.secrets.get("BRIDGE_SHARED_SECRET", os.environ.get("BRIDGE_SHARED_SECRET", ""))
+
 # Auth
 MIN_PASSWORD_LENGTH = 8
 
@@ -45,6 +64,7 @@ SESSION_DEFAULTS = [
     ("fc_idx", 0),
     ("fc_flipped", False),
     ("logged_in_user", None),
+    ("login_token", None),
     ("user_answers", {}),
     ("marked_review", {}),
     ("current_q", 0),
