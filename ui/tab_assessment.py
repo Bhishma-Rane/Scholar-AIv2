@@ -18,6 +18,39 @@ from core.analytics_store import record_quiz_attempt
 from features.mock_exams import grade_full_quiz
 
 
+# --- Font-size overrides for the assessment screen -------------------------
+# st.subheader() renders the question text larger than is comfortable for a
+# quiz reading flow, while st.radio()'s option labels render smaller than
+# the question — the opposite of what's readable. This CSS block rebalances
+# both. Scoped to this file only (injected once per render of this tab),
+# so it does not affect any other tab's styling.
+_ASSESSMENT_CSS = """
+<style>
+/* Question text (rendered via st.subheader inside the question screen) */
+div[data-testid="stSubheader"] p,
+div[data-testid="stSubheader"] {
+    font-size: 1.25rem !important;
+    line-height: 1.5 !important;
+}
+
+/* Radio button option labels (the MCQ choices) */
+div[data-testid="stRadio"] label p {
+    font-size: 1.05rem !important;
+    line-height: 1.5 !important;
+}
+
+/* Text area for subjective/short-answer questions, for consistency */
+div[data-testid="stTextArea"] textarea {
+    font-size: 1.05rem !important;
+}
+</style>
+"""
+
+
+def _inject_assessment_css():
+    st.markdown(_ASSESSMENT_CSS, unsafe_allow_html=True)
+
+
 def _render_setup_screen(username: str, active_subject: str, active_chapter: str, data_file: str):
     if os.path.exists(data_file):
         st.session_state.negative_marking_enabled = st.toggle(
@@ -51,6 +84,8 @@ def _render_setup_screen(username: str, active_subject: str, active_chapter: str
 
 
 def _render_question_screen():
+    _inject_assessment_css()
+
     q_idx = st.session_state.current_q
     quiz_data = st.session_state.quiz_data
     current_q = quiz_data[q_idx]
