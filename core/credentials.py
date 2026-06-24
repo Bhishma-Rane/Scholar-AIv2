@@ -1,95 +1,79 @@
 """
 core/credentials.py
 =====================
-Username/password storage for the login gate.
+Username/password handling for the login gate.
 
-Design notes:
-- Credentials live in a single JSON file at users/_credentials.json,
-  separate from any individual user's data folder.
-- Passwords are NEVER stored in plain text. Each password gets a unique
-  random salt (via hashlib.pbkdf2_hmac), so two users with the same
-  password produce different stored hashes, and the hash can't be
-  reversed or directly compared without redoing the same slow KDF work.
-- This is a file-based store appropriate for a small number of users
-  (single-machine / small-team deployments). See the "production
-  readiness" notes for when to swap this for a real database.
+CHANGED: credentials no longer live in a local JSON file on Streamlit
+Cloud's ephemeral filesystem (which was wiped every time the container
+recycled, silently deleting every account). They now live on the
+storage bridge running on Bhishma's Windows laptop (see
+core/bridge_client.py and storage_bridge.py), which persists indefinitely.
+
+The public function signatures (create_account, user_exists,
+verify_password) are UNCHANGED on purpose, so ui/auth.py and anywhere
+else that calls them needs no changes beyond what's needed for the new
+token-based auto-login (see issue_login_token / verify_login_token below,
+which are new additions, not replacements).
+
+Password hashing itself (PBKDF2-HMAC-SHA256, per-user random salt,
+constant-time comparison) still happens — it just happens on the bridge
+server now instead of in this process. See storage_bridge.py for the
+actual hashing code, which is identical to what used to live here.
 """
-import os
-import json
-import hmac
-import hashlib
-import secrets
+from core.bridge_client import (
+    create_account as _bridge_create_account,
+    user_exists as _bridge_user_exists,
+    verify_password as _bridge_verify_password,
+    issue_login_token as _bridge_issue_login_token,
+    verify_login_token as _bridge_verify_login_token,
+    revoke_login_token as _bridge_revoke_login_token,
+    BridgeUnavailableError,
+)
 
-from config import USERS_DIR
-
-CREDENTIALS_FILE = os.path.join(USERS_DIR, "_credentials.json")
-
-# PBKDF2 tuning. 260,000 iterations is the (then-)current OWASP-recommended
-# minimum for PBKDF2-HMAC-SHA256 as of this writing — re-check periodically
-# and bump upward as hardware gets faster.
-PBKDF2_ITERATIONS = 260_000
-SALT_BYTES = 16
-
-
-def _load_credentials() -> dict:
-    """Returns the {username: {salt, hash}} dict, or {} if the file doesn't exist yet."""
-    if not os.path.exists(CREDENTIALS_FILE):
-        return {}
-    try:
-        with open(CREDENTIALS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        # Corrupted or unreadable file: fail safe to "no accounts" rather than crashing.
-        return {}
-
-
-def _save_credentials(data: dict) -> None:
-    os.makedirs(USERS_DIR, exist_ok=True)
-    # Write to a temp file then replace, so a crash mid-write can't corrupt the store.
-    tmp_path = CREDENTIALS_FILE + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp_path, CREDENTIALS_FILE)
-
-
-def _hash_password(password: str, salt: bytes) -> str:
-    derived = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PBKDF2_ITERATIONS)
-    return derived.hex()
+# Re-exported so callers can catch this without importing bridge_client directly.
+__all__ = [
+    "create_account",
+    "user_exists",
+    "verify_password",
+    "issue_login_token",
+    "verify_login_token",
+    "revoke_login_token",
+    "BridgeUnavailableError",
+]
 
 
 def user_exists(username: str) -> bool:
-    return username in _load_credentials()
+    return _bridge_user_exists(username)
 
 
 def create_account(username: str, password: str) -> bool:
     """
-    Creates a new account. Returns False if the username is already taken
-    (caller should treat that as "use login instead, not signup").
+    Creates a new account on the storage bridge. Returns False if the
+    username is already taken (caller should treat that as "use login
+    instead, not signup").
     """
-    creds = _load_credentials()
-    if username in creds:
-        return False
-
-    salt = secrets.token_bytes(SALT_BYTES)
-    creds[username] = {
-        "salt": salt.hex(),
-        "hash": _hash_password(password, salt),
-    }
-    _save_credentials(creds)
-    return True
+    return _bridge_create_account(username, password)
 
 
 def verify_password(username: str, password: str) -> bool:
     """Returns True only if the username exists AND the password matches."""
-    creds = _load_credentials()
-    record = creds.get(username)
-    if record is None:
-        return False
+    return _bridge_verify_password(username, password)
 
-    salt = bytes.fromhex(record["salt"])
-    expected_hash = record["hash"]
-    candidate_hash = _hash_password(password, salt)
 
-    # Constant-time comparison to avoid leaking timing information about
-    # how many characters of the hash matched.
-    return hmac.compare_digest(candidate_hash, expected_hash)
+def issue_login_token(username: str, password: str):
+    """
+    Verifies credentials and, on success, returns a long-lived token that
+    can be stored in the browser's URL query params to enable auto-login
+    on a future page reload (see ui/auth.py). Returns None on bad credentials.
+    """
+    return _bridge_issue_login_token(username, password)
+
+
+def verify_login_token(token: str):
+    """Returns the username if the token is valid and unexpired, else None."""
+    return _bridge_verify_login_token(token)
+
+
+def revoke_login_token(token: str) -> None:
+    """Invalidates a login token — called on logout."""
+    _bridge_revoke_login_token(token)
