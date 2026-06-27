@@ -1,23 +1,3 @@
-"""
-ui/auth.py
-==========
-Username + password login gate, with a separate sign-up flow for new
-accounts. Stops script execution via st.stop() until a user is
-authenticated, so app.py can safely assume a logged-in user for
-everything that runs after calling require_login().
-
-AUTO-LOGIN: on successful login, a long-lived token (issued by the
-storage bridge — see core/credentials.py / core/bridge_client.py) is
-stored in the browser's URL query params. On every page load, BEFORE
-showing the login form, we check for that token and silently
-re-authenticate if it's valid — so a page reload or reopening the tab
-doesn't force a fresh login. Logging out clears both the token's
-server-side record (so it can't be reused) and the URL param.
-
-Failed login attempts are rate-limited per browser session (not
-per-username globally) to slow down naive brute-force guessing without
-needing any external infrastructure.
-"""
 import time
 
 import streamlit as st
@@ -30,7 +10,9 @@ from core.credentials import (
     issue_login_token,
     verify_login_token,
     revoke_login_token,
+    reset_password,
     BridgeUnavailableError,
+    BridgeRequestError,
 )
 
 MAX_ATTEMPTS_BEFORE_COOLDOWN = 5
@@ -46,7 +28,6 @@ def _init_auth_state():
 
 
 def _is_locked_out() -> float:
-    """Returns remaining lockout seconds (0 if not locked out)."""
     remaining = st.session_state.login_locked_until - time.time()
     return max(0.0, remaining)
 
@@ -64,14 +45,8 @@ def _record_successful_login():
 
 
 def _try_auto_login_from_url():
-    """
-    Runs once per page load, before the login form is shown. If a valid
-    auth token is present in the URL, logs the user in silently without
-    requiring the password form. Safe to call even when already logged
-    in (it's a no-op in that case).
-    """
     if st.session_state.get("logged_in_user"):
-        return  # already logged in this session, nothing to do
+        return
 
     token = st.query_params.get(TOKEN_QUERY_PARAM)
     if not token:
@@ -80,8 +55,6 @@ def _try_auto_login_from_url():
     try:
         username = verify_login_token(token)
     except BridgeUnavailableError:
-        # Bridge is down — fail open to the normal login form rather than
-        # blocking the user with a confusing error on every page load.
         return
 
     if username:
@@ -126,8 +99,6 @@ def _render_login_form():
                         st.session_state.login_token = token
                         st.query_params[TOKEN_QUERY_PARAM] = token
                 except BridgeUnavailableError:
-                    # Login itself still succeeded for this session — just
-                    # without auto-login persistence. Not worth blocking on.
                     pass
 
             st.rerun()
@@ -187,17 +158,60 @@ def _render_signup_form():
         st.rerun()
 
 
+def _render_forgot_password_form():
+    st.subheader("Reset Password")
+    st.caption(
+        "Locked out? Ask Bhishma for a reset code (in person or on "
+        "WhatsApp), then enter it below along with your new password."
+    )
+
+    reset_username = st.text_input("Username:", key="reset_username")
+    reset_token = st.text_input("Reset code (from Bhishma):", key="reset_token")
+    reset_new_password = st.text_input("New password:", type="password", key="reset_new_password")
+    reset_confirm_password = st.text_input("Confirm new password:", type="password", key="reset_confirm_password")
+
+    if st.button("Reset Password", type="primary", use_container_width=True, key="reset_submit"):
+        clean_username = reset_username.strip().lower()
+        clean_token = reset_token.strip()
+
+        if not clean_username or not clean_token or not reset_new_password:
+            st.error("Please fill in all fields.")
+            return
+        if reset_new_password != reset_confirm_password:
+            st.error("Passwords don't match.")
+            return
+        if len(reset_new_password) < MIN_PASSWORD_LENGTH:
+            st.error(f"Password must be at least {MIN_PASSWORD_LENGTH} characters.")
+            return
+
+        try:
+            reset_password(clean_username, clean_token, reset_new_password)
+        except BridgeRequestError as e:
+            st.error(e.detail)
+            if "expired" in e.detail.lower() or "used" in e.detail.lower() or "invalid" in e.detail.lower():
+                st.info("Ask Bhishma for a new reset code.")
+            return
+        except BridgeUnavailableError:
+            st.error(
+                "Can't reach the account server right now (the storage bridge "
+                "may be offline). Please try again in a moment."
+            )
+            return
+
+        st.success("Password reset! You can log in with your new password now.")
+        st.session_state["reset_username"] = ""
+        st.session_state["reset_token"] = ""
+        st.session_state["reset_new_password"] = ""
+        st.session_state["reset_confirm_password"] = ""
+
+
 def logout():
-    """Call this from the sidebar's logout button instead of manually
-    clearing session_state, so the server-side token is revoked too —
-    otherwise the URL token would still silently log the user back in
-    on the very next page load."""
     token = st.session_state.get("login_token")
     if token:
         try:
             revoke_login_token(token)
         except BridgeUnavailableError:
-            pass  # bridge down — token will just expire on its own eventually
+            pass
 
     if TOKEN_QUERY_PARAM in st.query_params:
         del st.query_params[TOKEN_QUERY_PARAM]
@@ -207,10 +221,6 @@ def logout():
 
 
 def require_login() -> str:
-    """
-    Renders the login/signup screen if no user is logged in yet, and
-    halts the script. Returns the logged-in username once available.
-    """
     _init_auth_state()
     _try_auto_login_from_url()
 
@@ -225,11 +235,13 @@ def require_login() -> str:
         col1, col2, col3 = st.columns([1, 2, 1])
         with col2:
             with st.container(border=True):
-                login_tab, signup_tab = st.tabs(["Login", "Sign Up"])
+                login_tab, signup_tab, forgot_tab = st.tabs(["Login", "Sign Up", "Forgot password?"])
                 with login_tab:
                     _render_login_form()
                 with signup_tab:
                     _render_signup_form()
+                with forgot_tab:
+                    _render_forgot_password_form()
         st.stop()
 
     return st.session_state.logged_in_user
