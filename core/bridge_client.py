@@ -16,9 +16,16 @@ than silently returning empty/false results, since "no accounts exist"
 and "can't reach the credential store" must never look the same to the
 caller — confusing those two would either lock everyone out or make
 account creation seem to fail when it's really a connectivity problem.
+
+BridgeRequestError (added alongside the password-reset feature) is the
+other failure mode: the bridge WAS reached and responded, but rejected
+this specific request as invalid (expired/used/bad token, password too
+short, etc.). Carries the bridge's own .detail message, which is safe to
+show directly in the UI. This is distinct from BridgeUnavailableError on
+purpose — one means "try again later, something's down", the other means
+"this specific thing you typed was wrong, here's why."
 """
 import requests
-import streamlit as st
 
 from config import BRIDGE_BASE_URL, BRIDGE_SHARED_SECRET
 
@@ -29,6 +36,19 @@ class BridgeUnavailableError(Exception):
     """Raised when the storage bridge can't be reached at all (network/DNS/timeout),
     as opposed to a normal application-level failure like 'wrong password'."""
     pass
+
+
+class BridgeRequestError(Exception):
+    """
+    Raised when the bridge is reachable and responded, but rejected the
+    request as invalid (4xx other than a bad shared secret) -- e.g. an
+    expired or already-used password reset token. Carries the bridge's
+    own detail message, which is safe to show directly to the user.
+    """
+    def __init__(self, detail: str, status_code: int):
+        self.detail = detail
+        self.status_code = status_code
+        super().__init__(detail)
 
 
 def _headers() -> dict:
@@ -51,6 +71,22 @@ def _post(path: str, **kwargs) -> dict:
             "Storage bridge rejected the request (bad shared secret). "
             "Check BRIDGE_SHARED_SECRET matches on both sides."
         )
+
+    # Any other 4xx means the bridge understood the request but rejected
+    # it as invalid (e.g. an expired password reset token) -- raise
+    # BridgeRequestError with the bridge's own message instead of letting
+    # raise_for_status() below throw an opaque HTTPError. None of the
+    # existing routes (create_account, verify_password, etc.) ever return
+    # a 4xx for normal "wrong answer" cases -- they return {"success":
+    # False} / {"valid": False} in a 200 instead -- so this only starts
+    # mattering for reset_password() below.
+    if 400 <= resp.status_code < 500:
+        try:
+            detail = resp.json().get("detail", f"Request failed ({resp.status_code})")
+        except ValueError:
+            detail = f"Request failed ({resp.status_code})"
+        raise BridgeRequestError(detail, resp.status_code)
+
     resp.raise_for_status()
     return resp.json()
 
@@ -71,14 +107,19 @@ def _get(path: str, **kwargs) -> dict:
             "Storage bridge rejected the request (bad shared secret). "
             "Check BRIDGE_SHARED_SECRET matches on both sides."
         )
+
+    if 400 <= resp.status_code < 500:
+        try:
+            detail = resp.json().get("detail", f"Request failed ({resp.status_code})")
+        except ValueError:
+            detail = f"Request failed ({resp.status_code})"
+        raise BridgeRequestError(detail, resp.status_code)
+
     resp.raise_for_status()
     return resp.json()
 
 
 def is_bridge_reachable() -> bool:
-    """Quick health check — used to show a friendly warning banner if the
-    laptop/tunnel is down, instead of letting every page interaction fail
-    with a raw connection error."""
     try:
         resp = requests.get(f"{BRIDGE_BASE_URL}/health", timeout=5)
         return resp.status_code == 200
@@ -86,9 +127,6 @@ def is_bridge_reachable() -> bool:
         return False
 
 
-# ---------------------------------------------------------------------
-# Auth
-# ---------------------------------------------------------------------
 def create_account(username: str, password: str) -> bool:
     result = _post("/auth/create_account", json={"username": username, "password": password})
     return result["success"]
@@ -104,20 +142,36 @@ def verify_password(username: str, password: str) -> bool:
     return result["valid"]
 
 
-def issue_login_token(username: str, password: str) -> "str | None":
-    """Verifies credentials and, if valid, returns a long-lived token for auto-login."""
+def issue_login_token(username: str, password: str):
     result = _post("/auth/issue_token", json={"username": username, "password": password})
     return result["token"] if result["valid"] else None
 
 
-def verify_login_token(token: str) -> "str | None":
-    """Returns the username if the token is valid and unexpired, else None."""
+def verify_login_token(token: str):
     result = _post("/auth/verify_token", json={"token": token})
     return result["username"] if result["valid"] else None
 
 
 def revoke_login_token(token: str) -> None:
     _post("/auth/revoke_token", json={"token": token})
+
+
+# ---------------------------------------------------------------------
+# Password reset (admin-issued -- see reset_password.py on Bhishma's
+# machine, which generates the token a student is given out-of-band)
+# ---------------------------------------------------------------------
+def reset_password(username: str, token: str, new_password: str) -> None:
+    """
+    Applies an admin-issued password reset token. Raises BridgeRequestError
+    with a human-readable .detail (e.g. "This token has expired") if the
+    token is invalid/expired/already used, or if the new password fails
+    the bridge's own minimum-length check. Raises BridgeUnavailableError
+    if the bridge can't be reached at all. Returns None on success.
+    """
+    _post(
+        "/auth/reset_password",
+        json={"username": username, "token": token, "new_password": new_password},
+    )
 
 
 # ---------------------------------------------------------------------
