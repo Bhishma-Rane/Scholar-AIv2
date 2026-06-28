@@ -160,6 +160,14 @@ def _render_signup_form():
 
 def _render_forgot_password_form():
     st.subheader("Reset Password")
+
+    if st.session_state.get("reset_password_done"):
+        st.success("Password reset! You can log in with your new password now.")
+        if st.button("Back to reset form", key="reset_back_to_form"):
+            st.session_state["reset_password_done"] = False
+            st.rerun()
+        return
+
     st.caption(
         "Locked out? Ask Bhishma for a reset code (in person or on "
         "WhatsApp), then enter it below along with your new password."
@@ -198,11 +206,16 @@ def _render_forgot_password_form():
             )
             return
 
-        st.success("Password reset! You can log in with your new password now.")
-        st.session_state["reset_username"] = ""
-        st.session_state["reset_token"] = ""
-        st.session_state["reset_new_password"] = ""
-        st.session_state["reset_confirm_password"] = ""
+        # Don't write to st.session_state["reset_username"] etc. here --
+        # those keys are bound to the text_input widgets above, and
+        # Streamlit forbids setting a widget-bound key after the widget
+        # has already been instantiated in this run (raises
+        # StreamlitAPIException). Use a rerun + separate flag instead,
+        # same pattern _render_login_form() already uses on success --
+        # the rerun naturally clears the form since this branch (done=True)
+        # renders instead of the inputs.
+        st.session_state["reset_password_done"] = True
+        st.rerun()
 
 
 def logout():
