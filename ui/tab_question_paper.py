@@ -80,6 +80,9 @@ def _flatten_questions(paper: dict) -> list:
 def _render_setup_screen(username: str):
     try:
         papers = list_papers(published_only=True)
+    except BridgeRequestError as e:
+        st.error(f"Couldn't load question papers: {e.detail}")
+        return
     except BridgeUnavailableError:
         st.error("Can't reach the account server right now. Please try again in a moment.")
         return
