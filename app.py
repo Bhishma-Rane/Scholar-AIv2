@@ -26,6 +26,8 @@ from ui.tab_batch_gen import render_batch_gen_tab
 from ui.tab_assessment import render_assessment_tab
 from ui.tab_progress import render_progress_tab
 from ui.tab_viewer import render_viewer_tab
+from ui.tab_feedback import render_feedback_tab
+from ui.tab_question_paper import render_question_paper_tab
 
 # ---------------------------------------------------------------------
 # 1. PAGE SETUP
@@ -67,7 +69,7 @@ target_language = selections["target_language"]
 # ---------------------------------------------------------------------
 # 5. TABBED APPLICATION MATRIX
 # ---------------------------------------------------------------------
-tab_dashboard, tab_chat, tab_tools, tab_flash, tab_gen, tab_quiz, tab_progress, tab_viewer, tab_tutorial = st.tabs(
+tab_dashboard, tab_chat, tab_tools, tab_flash, tab_gen, tab_quiz, tab_progress, tab_viewer, tab_tutorial, tab_feedback, tab_qp = st.tabs(
     [
         "🤖 Dashboard",
         "💬 Tutor",
@@ -78,9 +80,10 @@ tab_dashboard, tab_chat, tab_tools, tab_flash, tab_gen, tab_quiz, tab_progress, 
         "📊 Progress",
         "📄 Viewer",
         "❓ Tutorial",
+        "📝 Feedback",
+        "📋 Question Paper",
     ]
 )
-
 with tab_dashboard:
     render_dashboard_tab(username, active_subject, target_language)
 
@@ -107,3 +110,9 @@ with tab_viewer:
 
 with tab_tutorial:
     render_tutorial_tab(username)
+    
+with tab_feedback:
+    render_feedback_tab(username)
+    
+with tab_qp:
+    render_question_paper_tab(username, target_language)
