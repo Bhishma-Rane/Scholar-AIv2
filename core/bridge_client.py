@@ -262,3 +262,15 @@ def submit_paper_attempt(attempt_id: int, username: str, answers: list, lang: st
 
 def get_paper_attempt_result(attempt_id: int, username: str) -> dict:
     return _get("/papers/attempt_result", params={"attempt_id": attempt_id, "username": username})
+
+
+# ---------------------------------------------------------------------
+# Theme color preference (persists per-account, follows them everywhere)
+# ---------------------------------------------------------------------
+def get_theme_color(username: str) -> str:
+    result = _get("/users/theme_color", params={"username": username})
+    return result["theme_color"]
+
+
+def set_theme_color(username: str, theme_color: str) -> None:
+    _post("/users/theme_color", json={"username": username, "theme_color": theme_color})
