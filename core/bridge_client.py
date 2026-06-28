@@ -225,3 +225,40 @@ def download_file(username: str, subject: str, filename: str) -> bytes:
 
 def delete_file(username: str, subject: str, filename: str) -> None:
     _post("/files/delete", data={"username": username, "subject": subject, "filename": filename})
+
+
+# ---------------------------------------------------------------------
+# Question Papers
+# ---------------------------------------------------------------------
+def list_papers(published_only: bool = True) -> list:
+    result = _get("/papers/list", params={"published_only": published_only})
+    return result["papers"]
+
+
+def get_paper(paper_id: int) -> dict:
+    return _get("/papers/get", params={"paper_id": paper_id})
+
+
+def start_paper_attempt(username: str, paper_id: int, mode: str, timer_seconds: int = None) -> dict:
+    payload = {"username": username, "paper_id": paper_id, "mode": mode}
+    if timer_seconds is not None:
+        payload["timer_seconds"] = timer_seconds
+    return _post("/papers/start_attempt", json=payload)
+
+
+def submit_paper_attempt(attempt_id: int, username: str, answers: list, lang: str = "English") -> dict:
+    """
+    answers: list of dicts, each shaped like:
+        {"question_id": int, "answer_text": str|None, "answer_blanks": list|None,
+         "answer_option": str|None, "answer_x_pct": float|None, "answer_y_pct": float|None}
+    Only the fields relevant to that question's type need to be set; the
+    others can be omitted/None.
+    """
+    return _post(
+        "/papers/submit_attempt",
+        json={"attempt_id": attempt_id, "username": username, "answers": answers, "lang": lang},
+    )
+
+
+def get_paper_attempt_result(attempt_id: int, username: str) -> dict:
+    return _get("/papers/attempt_result", params={"attempt_id": attempt_id, "username": username})
