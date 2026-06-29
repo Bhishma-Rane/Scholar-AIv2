@@ -64,9 +64,9 @@ def _post(path: str, **kwargs) -> dict:
             **kwargs,
         )
     except requests.exceptions.RequestException as e:
-    import traceback
-    traceback.print_exc()
-    raise
+        import traceback
+        traceback.print_exc()
+        raise
 
     if resp.status_code == 401:
         raise BridgeUnavailableError(
