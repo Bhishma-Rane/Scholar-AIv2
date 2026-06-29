@@ -26,6 +26,7 @@ purpose — one means "try again later, something's down", the other means
 "this specific thing you typed was wrong, here's why."
 """
 import requests
+print("bridge_client.py LOADED")
 
 from config import BRIDGE_BASE_URL, BRIDGE_SHARED_SECRET
 
