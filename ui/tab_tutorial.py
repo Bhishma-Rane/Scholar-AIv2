@@ -1,18 +1,22 @@
 """
 ui/tab_tutorial.py
 =====================
-The first-run tutorial: a welcome screen, three goal-based guided
-pathways (pick one, walk through numbered steps pointing at real tabs),
-and a full feature reference for anyone who wants the complete picture
-instead of a guided walkthrough. Shown automatically once per account
-(core.onboarding_store tracks completion) and re-enterable anytime via
-the sidebar.
+The guided tour content, now rendered as a spotlight overlay (dims the
+real app, highlights the relevant tab/element) instead of a plain text
+card -- since most people were skipping the old text-only version.
+
+This is no longer a top-level tab (see ui/tab_settings.py, which has the
+"Replay Tutorial" button that triggers this). render_tutorial_tab() is
+still used for the automatic first-run gate in app.py (a new account
+sees the pathway picker full-screen before anything else), but the
+step-by-step walkthrough itself now uses the spotlight overlay.
 """
 import streamlit as st
 
 from config import APP_NAME, APP_TAGLINE
 from core.onboarding_store import mark_tutorial_complete
 from ui.tutorial_content import PATHWAYS, FEATURE_REFERENCE
+from ui.tutorial_overlay import render_tutorial_overlay, cleanup_tutorial_overlay, TUTORIAL_STEPS
 
 
 def _init_tutorial_state():
@@ -55,36 +59,37 @@ def _render_pathway_picker():
                 st.rerun()
 
 
-def _render_pathway_walkthrough(pathway_key: str):
-    pathway = PATHWAYS[pathway_key]
-    steps = pathway["steps"]
+def _render_spotlight_walkthrough():
+    """
+    Replaces the old plain step-card with the dimmed spotlight overlay
+    (ui/tutorial_overlay.py) -- the visual highlight is rendered by that
+    component, while the Next/Back/Skip controls below are plain
+    Streamlit buttons (an iframe sandbox can't host clickable Streamlit
+    widgets itself, so the real interaction lives here, outside it).
+    """
+    steps = TUTORIAL_STEPS
     idx = st.session_state.tutorial_step_index
     idx = max(0, min(idx, len(steps) - 1))
-    step = steps[idx]
 
-    st.markdown(f"#### {pathway['label']}")
+    render_tutorial_overlay(steps, idx)
+
     st.progress((idx + 1) / len(steps), text=f"Step {idx + 1} of {len(steps)}")
-
-    with st.container(border=True):
-        st.markdown(f"##### {step['title']}")
-        st.caption(f"📍 Found in: {step['tab']}")
-        st.markdown(step["body"])
 
     c1, c2, c3 = st.columns([1, 1, 1])
     with c1:
-        if st.button("⬅️ Back", disabled=(idx == 0), use_container_width=True):
+        if st.button("⬅️ Back", disabled=(idx == 0), use_container_width=True, key="overlay_back"):
             st.session_state.tutorial_step_index -= 1
             st.rerun()
     with c2:
-        if st.button("🔁 Choose a Different Path", use_container_width=True):
-            st.session_state.tutorial_selected_pathway = None
-            st.session_state.tutorial_step_index = 0
-            st.rerun()
+        if st.button("⏭️ Skip Tour", use_container_width=True, key="overlay_skip"):
+            cleanup_tutorial_overlay()
+            return "finish"
     with c3:
         is_last_step = idx == len(steps) - 1
-        label = "✅ Finish Tutorial" if is_last_step else "Next ➡️"
-        if st.button(label, type="primary", use_container_width=True):
+        label = "✅ Finish" if is_last_step else "Next ➡️"
+        if st.button(label, type="primary", use_container_width=True, key="overlay_next"):
             if is_last_step:
+                cleanup_tutorial_overlay()
                 return "finish"
             st.session_state.tutorial_step_index += 1
             st.rerun()
@@ -99,9 +104,9 @@ def _render_feature_reference():
 
 def render_tutorial_tab(username: str) -> bool:
     """
-    Renders the tutorial screen. Returns True if the user has just
-    finished/skipped it this run (caller should st.rerun() to drop into
-    the main app), False otherwise.
+    Renders the first-run tutorial gate (full-screen, before the main
+    app). Returns True once the user has finished/skipped (caller
+    should st.rerun() to drop into the main app), False otherwise.
     """
     _init_tutorial_state()
 
@@ -118,10 +123,28 @@ def render_tutorial_tab(username: str) -> bool:
             return True
         return False
     else:
-        result = _render_pathway_walkthrough(st.session_state.tutorial_selected_pathway)
-        st.markdown("---")
-        _render_feature_reference()
+        result = _render_spotlight_walkthrough()
         if result == "finish":
             mark_tutorial_complete(username)
             return True
         return False
+
+
+def render_tutorial_overlay_if_active(username: str):
+    """
+    Called from app.py on EVERY render (after the main tab UI exists),
+    so the "Replay Tutorial" button in Settings can trigger the
+    spotlight walkthrough over the real app -- as opposed to
+    render_tutorial_tab(), which is only for the very first, full-screen,
+    pre-sidebar gate.
+    """
+    if not st.session_state.get("show_tutorial_overlay"):
+        return
+
+    _init_tutorial_state()
+    result = _render_spotlight_walkthrough()
+    if result == "finish":
+        st.session_state["show_tutorial_overlay"] = False
+        st.session_state.tutorial_selected_pathway = None
+        st.session_state.tutorial_step_index = 0
+        st.rerun()
