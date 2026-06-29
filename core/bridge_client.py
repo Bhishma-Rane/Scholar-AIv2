@@ -63,6 +63,11 @@ def _post(path: str, **kwargs) -> dict:
             timeout=REQUEST_TIMEOUT,
             **kwargs,
         )
+
+        print("POST:", f"{BRIDGE_BASE_URL}{path}")
+        print("STATUS:", resp.status_code)
+        print("TEXT:", resp.text)
+
     except requests.exceptions.RequestException as e:
         import traceback
         traceback.print_exc()
@@ -94,6 +99,8 @@ def _post(path: str, **kwargs) -> dict:
 
 
 def _get(path: str, **kwargs) -> dict:
+    def _get(path: str, **kwargs) -> dict:
+    def _get(path: str, **kwargs) -> dict:
     try:
         resp = requests.get(
             f"{BRIDGE_BASE_URL}{path}",
@@ -101,6 +108,11 @@ def _get(path: str, **kwargs) -> dict:
             timeout=REQUEST_TIMEOUT,
             **kwargs,
         )
+
+        print("GET:", f"{BRIDGE_BASE_URL}{path}")
+        print("STATUS:", resp.status_code)
+        print("TEXT:", resp.text)
+
     except requests.exceptions.RequestException as e:
         raise BridgeUnavailableError(f"Could not reach storage bridge at {path}: {e}") from e
 
