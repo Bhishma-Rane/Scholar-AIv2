@@ -5,10 +5,11 @@ Central place for app-wide constants, Streamlit page configuration,
 and global CSS.
 """
 import os
+import tempfile
 import streamlit as st
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-USERS_DIR = os.path.join(BASE_DIR, "users")
+USERS_DIR = os.path.join(tempfile.gettempdir(), "scholarai_users")
 os.makedirs(USERS_DIR, exist_ok=True)
 
 APP_NAME = "ScholarAI"
