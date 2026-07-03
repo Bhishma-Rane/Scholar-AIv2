@@ -57,11 +57,12 @@ def _headers() -> dict:
 
 
 def _post(path: str, **kwargs) -> dict:
+    timeout = kwargs.pop("timeout", REQUEST_TIMEOUT)
     try:
         resp = requests.post(
             f"{BRIDGE_BASE_URL}{path}",
             headers=_headers(),
-            timeout=REQUEST_TIMEOUT,
+            timeout=timeout,
             **kwargs,
         )
 
@@ -214,6 +215,7 @@ def upload_file(username: str, subject: str, filename: str, file_bytes: bytes) -
         "/files/upload",
         data={"username": username, "subject": subject},
         files={"file": (filename, file_bytes)},
+        timeout=60,
     )
     return result["filename"]
 
