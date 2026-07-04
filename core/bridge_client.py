@@ -247,9 +247,52 @@ def delete_file(username: str, subject: str, filename: str) -> None:
 # ---------------------------------------------------------------------
 # Question Papers
 # ---------------------------------------------------------------------
-def list_papers(published_only: bool = True) -> list:
-    result = _get("/papers/list", params={"published_only": published_only})
+def list_papers(username: str, subject: str = None) -> list:
+    """
+    Returns the papers belonging to `username`, newest first. There's no
+    publish/draft step anymore -- a paper is listed the moment it's created.
+    """
+    params = {"username": username}
+    if subject:
+        params["subject"] = subject
+    result = _get("/papers/list", params=params)
     return result["papers"]
+
+
+def create_paper(username: str, title: str, subject: str = None) -> dict:
+    """Creates an empty paper shell (no sections/questions yet). Returns
+    {"paper_id": int, "title": str, "subject": str|None}."""
+    return _post("/papers/create", json={"username": username, "title": title, "subject": subject})
+
+
+def add_paper_section(paper_id: int, title: str, instructions: str = None, order_index: int = 0) -> dict:
+    return _post(
+        "/papers/add_section",
+        json={"paper_id": paper_id, "title": title, "instructions": instructions, "order_index": order_index},
+    )
+
+
+def add_paper_question(
+    section_id: int,
+    type: str,
+    marks: float,
+    order_index: int = 0,
+    question_text: str = None,
+    parent_question_id: int = None,
+    extra: dict = None,
+) -> dict:
+    return _post(
+        "/papers/add_question",
+        json={
+            "section_id": section_id,
+            "type": type,
+            "marks": marks,
+            "order_index": order_index,
+            "question_text": question_text,
+            "parent_question_id": parent_question_id,
+            "extra": extra,
+        },
+    )
 
 
 def get_paper(paper_id: int) -> dict:
