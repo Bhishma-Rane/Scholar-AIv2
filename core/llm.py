@@ -92,7 +92,8 @@ def get_llm(model_type: str = "main", request_timeout: float = 60.0):
     Get a ChatOllama instance configured for the specified task.
 
     Args:
-        model_type: "main" for standard inference, "quiz" for quiz generation
+        model_type: "main" for standard inference, "quiz" for quiz generation,
+            "paper" for question-paper generation (one section per call).
         request_timeout: seconds before the underlying httpx client aborts
             the request. This is the REAL timeout — it actually cancels the
             TCP connection to Ollama, unlike a bare Python thread timeout.
@@ -118,6 +119,15 @@ def get_llm(model_type: str = "main", request_timeout: float = 60.0):
             # comfortably enough for a handful of questions per chunk while
             # keeping worst-case generation time low.
             return ChatOllama(**common_kwargs, num_ctx=8192, num_predict=1024)
+        if model_type == "paper":
+            # Question papers generate ONE SECTION AT A TIME (see
+            # features/question_paper_generator.py) rather than one giant
+            # multi-section prompt — a full 8-type paper in a single call
+            # regularly exceeded even a 60s httpx timeout. 2048 tokens
+            # comfortably covers a section's worth of questions (including
+            # a case_based section's passage + 3 sub-questions) while
+            # keeping each individual call's worst-case time bounded.
+            return ChatOllama(**common_kwargs, num_ctx=8192, num_predict=2048)
         return ChatOllama(**common_kwargs, num_ctx=8192)
     except Exception as e:
         print(f"[ScholarAI] Error connecting to Ollama: {e}")
