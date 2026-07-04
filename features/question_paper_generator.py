@@ -29,6 +29,17 @@ passes exactly how many of each question type they want -- e.g.
 fall out of that directly. See _validate_question_counts for the
 guardrails that keep a request from timing out the LLM call.
 
+GENERATION IS RETRY-BASED PER ITEM (see _generate_item_questions).
+Ollama models routinely ignore "produce EXACTLY N questions" and close
+the JSON early once they feel "done," well before num_predict is
+exhausted -- so a single call's output is a LOWER BOUND on what was
+asked for, never treated as final. If a call comes back short, a
+follow-up call asks only for the still-missing count (with the
+already-generated questions listed so the model doesn't repeat itself),
+up to MAX_ITEM_ATTEMPTS tries. If a call fails outright (timeout, bad
+JSON, empty list), that's also just one attempt -- it gets retried like
+any other shortfall rather than immediately giving up on the whole
+question type.
 """
 import json
 
@@ -82,6 +93,14 @@ DEFAULT_QUESTION_COUNTS = {
 # question count rather than let the UI ask for anything.
 MAX_COUNT_PER_TYPE = 25
 MAX_TOTAL_QUESTIONS = 60
+
+# How many LLM calls we're willing to make for a SINGLE item (question
+# type) before accepting whatever we've got. The first call asks for the
+# full count; each subsequent call asks only for whatever's still
+# missing. 3 gives the model two chances to make up a shortfall without
+# letting one stubborn type blow up the total time budget for the paper
+# (worst case: MAX_ITEM_ATTEMPTS calls * ITEM_TIMEOUT_SECONDS per item).
+MAX_ITEM_ATTEMPTS = 3
 
 
 def estimate_total_marks(question_counts: dict) -> int:
@@ -165,21 +184,40 @@ def _build_section_plan(question_counts: dict) -> list:
     return [sections[title] for title in _SECTION_ORDER if title in sections]
 
 
-def _build_item_prompt(chapter_text: str, chapter: str, language: str, item: dict) -> str:
+def _build_item_prompt(
+    chapter_text: str,
+    chapter: str,
+    language: str,
+    item: dict,
+    count_override: int = None,
+    avoid_questions: list = None,
+) -> str:
     """
-    Builds a prompt for a SINGLE question type only (see generate_question_paper,
-    which now makes one LLM call per TYPE, not even per section). A section
-    like "Section A" can mix 4 different types (mcq/fill_blank/A-R/vsa)
-    totalling 20 questions -- asking for all of them in one call still blew
-    past num_predict and got silently truncated to a single question (the
-    model closes the JSON early to stay syntactically valid once it runs
-    out of budget, so no error fires, you just get way fewer questions than
-    asked for). Generating one type at a time keeps each response small
-    enough to actually fit inside the "paper" model_type's token budget.
+    Builds a prompt for a SINGLE question type only, asking for
+    `count_override` questions if given (used by retry/top-up calls that
+    only need the still-missing remainder) or item["count"] otherwise.
+
+    A section like "Section A" can mix 4 different types (mcq/fill_blank/
+    A-R/vsa) totalling 20 questions -- asking for all of them in one call
+    still blew past num_predict and got silently truncated to a single
+    question (the model closes the JSON early to stay syntactically
+    valid once it runs out of budget, so no error fires, you just get
+    way fewer questions than asked for). Generating one type at a time
+    keeps each response small enough to actually fit inside the "paper"
+    model_type's token budget -- but even then, models frequently
+    under-deliver on the exact count within a single call, which is why
+    the caller (_generate_item_questions) treats this as retriable.
+
+    `avoid_questions`, when given, lists short summaries of questions
+    already generated for this item in an earlier attempt, so a
+    follow-up call fills the gap with NEW questions instead of repeating
+    ones we already have.
     """
+    count = count_override if count_override is not None else item["count"]
+
     if item["type"] == "case_based":
         plan_line = (
-            f'Produce EXACTLY {item["count"]} case-based question(s). Each one has a short passage '
+            f'Produce EXACTLY {count} case-based question(s). Each one has a short passage '
             f'and EXACTLY 3 sub-questions worth {item["sub_marks"][0]}, {item["sub_marks"][1]}, and '
             f'{item["sub_marks"][2]} marks (in that order).'
         )
@@ -197,7 +235,7 @@ def _build_item_prompt(chapter_text: str, chapter: str, language: str, item: dic
   ]
 }"""
     else:
-        plan_line = f'Produce EXACTLY {item["count"]} question(s) of type "{item["type"]}", {item["marks"]} marks each.'
+        plan_line = f'Produce EXACTLY {count} question(s) of type "{item["type"]}", {item["marks"]} marks each.'
         shape = f"""{{
   "questions": [
     {{
@@ -208,6 +246,14 @@ def _build_item_prompt(chapter_text: str, chapter: str, language: str, item: dic
     }}
   ]
 }}"""
+
+    avoid_block = ""
+    if avoid_questions:
+        listed = "\n".join(f"- {q}" for q in avoid_questions)
+        avoid_block = (
+            f"\n\nThese questions have ALREADY been used in this paper -- do NOT repeat them "
+            f"or produce close variants of them. Write entirely new, different questions:\n{listed}"
+        )
 
     return f"""You are writing questions for one part of a formal exam question paper for the chapter
 "{chapter}", based ONLY on the text provided below. Write all question text, passages, and answer
@@ -227,7 +273,7 @@ Rules for "extra" by type:
   The number of "___" markers MUST exactly equal the number of items in "blanks".
 - assertion_reason: extra = {{"assertion": "<statement A>", "reason": "<statement R>", "correct_option": "A"|"B"|"C"|"D"}}.
 
-IMPORTANT: the "questions" array must contain EXACTLY {item["count"]} item(s) -- not fewer, not more.
+IMPORTANT: the "questions" array must contain EXACTLY {count} item(s) -- not fewer, not more.{avoid_block}
 
 Chapter text:
 {chapter_text}"""
@@ -335,6 +381,128 @@ def _validate_question_extra_clientside(qtype: str, extra: dict) -> bool:
     return False  # map_marking or anything unrecognized -- never accepted here
 
 
+def _validate_generated_question(question: dict, item: dict) -> bool:
+    """
+    Validates ONE question the LLM produced for `item` against the same
+    rules add_paper_question will eventually enforce (plus a couple of
+    shape checks specific to case_based). This runs INSIDE the retry loop
+    -- see _generate_item_questions -- so a malformed question doesn't
+    silently count toward "we got enough of this type" and short-circuit
+    a retry that would have gotten a usable one instead.
+    """
+    qtype = question.get("type")
+
+    if item["type"] == "case_based":
+        if qtype != "case_based":
+            return False
+        if not _validate_question_extra_clientside("case_based", question.get("extra")):
+            return False
+        subs = question.get("sub_questions") or []
+        if len(subs) != 3:
+            return False
+        for sub, expected_marks in zip(subs, item["sub_marks"]):
+            sub_type = sub.get("type")
+            sub_marks = sub.get("marks")
+            sub_extra = sub.get("extra")
+            sub_text = sub.get("question_text")
+            if sub_type not in SUB_QUESTION_TYPES:
+                return False
+            if sub_marks != expected_marks:
+                return False
+            if not _validate_question_extra_clientside(sub_type, sub_extra):
+                return False
+            if sub_type in ("vsa", "sa", "mcq") and not sub_text:
+                return False
+        return True
+
+    if qtype != item["type"]:
+        return False
+    marks = question.get("marks")
+    if not isinstance(marks, (int, float)) or marks <= 0:
+        return False
+    if not _validate_question_extra_clientside(qtype, question.get("extra")):
+        return False
+    if qtype in ("mcq", "vsa", "sa", "la") and not question.get("question_text"):
+        return False
+    return True
+
+
+def _question_summary(question: dict) -> str:
+    """
+    Short human-readable stand-in for a generated question, used only to
+    (a) tell a retry call what's already been used so it doesn't repeat
+    itself, and (b) de-duplicate across attempts if the model reproduces
+    something close to a question it already gave us.
+    """
+    text = question.get("question_text")
+    if text:
+        return text.strip()[:120]
+    extra = question.get("extra") or {}
+    if extra.get("text_with_blanks"):
+        return str(extra["text_with_blanks"]).strip()[:120]
+    if extra.get("passage"):
+        return str(extra["passage"]).strip()[:120]
+    if extra.get("assertion"):
+        return str(extra["assertion"]).strip()[:120]
+    return "previous question"
+
+
+def _generate_item_questions(llm, chapter_text: str, chapter: str, language: str, item: dict, timeout_seconds: int) -> tuple:
+    """
+    Generates item["count"] valid questions for a single question-type
+    item, retrying with follow-up calls for whatever's still missing
+    rather than accepting whatever the first call happened to return.
+
+    Ollama models routinely under-deliver on "give me exactly N" --
+    closing the JSON early once they feel "done," well before
+    num_predict is actually exhausted -- so a single call's output is a
+    LOWER BOUND, not the final answer. A call that fails outright
+    (timeout, unparseable JSON, empty "questions" list) is treated the
+    same way: as a shortfall of the full count, retried like any other,
+    rather than immediately abandoning the whole question type.
+
+    Each candidate question is validated with _validate_generated_question
+    before it counts toward the target, so a malformed question doesn't
+    fill a "slot" that a retry could have filled with something usable.
+
+    Returns (valid_questions, attempts_used). valid_questions may still
+    be shorter than item["count"] if MAX_ITEM_ATTEMPTS is exhausted --
+    the caller is responsible for flagging that shortfall.
+    """
+    collected = []
+    seen_summaries = set()
+    attempts = 0
+
+    while len(collected) < item["count"] and attempts < MAX_ITEM_ATTEMPTS:
+        remaining = item["count"] - len(collected)
+        avoid = [_question_summary(q) for q in collected] if collected else None
+        prompt = _build_item_prompt(
+            chapter_text, chapter, language, item,
+            count_override=remaining, avoid_questions=avoid,
+        )
+        raw = invoke_with_timeout(llm, prompt, timeout_seconds=timeout_seconds)
+        attempts += 1
+        if raw is None:
+            continue  # timed out -- try again rather than giving up on the type
+        try:
+            parsed = _extract_json(raw)
+        except (ValueError, json.JSONDecodeError):
+            continue  # bad JSON this round -- try again
+
+        for q in parsed.get("questions") or []:
+            if not _validate_generated_question(q, item):
+                continue
+            summary = _question_summary(q)
+            if summary in seen_summaries:
+                continue  # model repeated itself despite the avoid-list
+            seen_summaries.add(summary)
+            collected.append(q)
+            if len(collected) >= item["count"]:
+                break
+
+    return collected, attempts
+
+
 def generate_question_paper(
     username: str,
     subject: str,
@@ -357,19 +525,14 @@ def generate_question_paper(
              "questions_added": int, "questions_skipped": int,
              "estimated_total_marks": int, "failed_sections": list[str]}.
 
-    Generation happens ONE QUESTION TYPE AT A TIME (a separate LLM call
-    each for "6 mcq", "4 fill_blank", "4 case_based", etc.) rather than
-    one call per section or one call for the whole paper -- a section
-    can bundle up to 4 different types with a large combined count, and
-    asking for all of them in a single call still overflowed the
-    response's token budget: the model closes the JSON early to stay
-    syntactically valid once it runs out of room, so nothing errors,
-    you just silently get far fewer questions than requested. Per-type
-    calls keep each individual response small enough to reliably contain
-    the FULL requested count. A type whose call times out or returns
-    unusable JSON is skipped (its label lands in "failed_sections")
-    rather than aborting the whole paper -- the student still gets
-    everything that DID generate successfully.
+    Generation happens ONE QUESTION TYPE AT A TIME, and each type is
+    generated via _generate_item_questions -- which retries with
+    top-up calls (up to MAX_ITEM_ATTEMPTS) whenever a call returns
+    fewer valid questions than requested, rather than silently accepting
+    a short first response. A type that still falls short after all
+    retries lands in "failed_sections" labelled with how many it
+    actually got (e.g. "case_based (2/4)") instead of just vanishing
+    from the paper with no visible signal.
 
     Raises ValueError if question_counts is invalid/empty/too large, the
     chapter text is missing, the LLM is unreachable, or literally every
@@ -392,41 +555,29 @@ def generate_question_paper(
 
     # "paper" model_type -- see core/llm.py -- is sized (num_predict) for
     # ONE TYPE's worth of questions per call. ITEM_TIMEOUT_SECONDS is per
-    # call; with up to ~8 items across the whole paper this means several
-    # small, fast calls instead of one huge one that silently truncates.
+    # call; with retries this means several small, fast calls per item
+    # instead of one huge one that silently truncates.
     ITEM_TIMEOUT_SECONDS = 75
     llm = get_llm(model_type="paper", request_timeout=ITEM_TIMEOUT_SECONDS)
     if llm is None:
         raise ValueError("Could not connect to the LLM.")
 
-    # Generate ONE QUESTION TYPE AT A TIME. Asking for a whole section in
-    # one call (e.g. Section A = mcq + fill_blank + assertion_reason + vsa,
-    # 20 questions total) still overflowed num_predict -- the model closes
-    # the JSON early to stay syntactically valid once it runs out of
-    # budget, so no error fires, you just silently get far fewer questions
-    # than requested. Per-type calls keep each response small enough to
-    # actually contain the full requested count. An item that times out or
-    # returns unusable JSON is skipped rather than aborting the whole
-    # paper -- the student still gets everything else that DID generate.
     generated_sections = []  # [{"title", "instructions", "questions": [...]}]
     failed_item_labels = []
     for section in plan:
         section_questions = []
         for item in section["items"]:
-            item_prompt = _build_item_prompt(context_slice, chapter, lang, item)
-            raw = invoke_with_timeout(llm, item_prompt, timeout_seconds=ITEM_TIMEOUT_SECONDS)
-            if raw is None:
-                failed_item_labels.append(item["label"])
-                continue
-            try:
-                parsed_item = _extract_json(raw)
-            except (ValueError, json.JSONDecodeError):
-                failed_item_labels.append(item["label"])
-                continue
-            questions = parsed_item.get("questions") or []
+            questions, _attempts = _generate_item_questions(
+                llm, context_slice, chapter, lang, item, ITEM_TIMEOUT_SECONDS,
+            )
             if not questions:
                 failed_item_labels.append(item["label"])
                 continue
+            if len(questions) < item["count"]:
+                # Got SOME, but fewer than asked for even after retries --
+                # still usable, but flag it instead of pretending the
+                # paper has exactly what was requested.
+                failed_item_labels.append(f'{item["label"]} ({len(questions)}/{item["count"]})')
             section_questions.extend(questions)
         if section_questions:
             generated_sections.append({
