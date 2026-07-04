@@ -142,11 +142,61 @@ Chapter text:
 {chapter_text}"""
 
 
-def _extract_json(raw: str) -> dict:
-    match = re.search(r"\{.*\}", raw, re.DOTALL)
-    if not match:
+def _find_json_object(raw: str) -> str:
+    """
+    Finds the outermost {...} block by brace-depth counting rather than a
+    greedy regex. A greedy `\{.*\}` grabs from the FIRST `{` to the LAST
+    `}` in the whole response -- if the model appends any chatty text
+    with its own stray braces after the real JSON, that regex silently
+    stitches unrelated text into the "JSON" it hands to json.loads(),
+    which is what produces confusing errors like "Expecting ',' delimiter"
+    deep in the middle of an otherwise-fine object.
+    """
+    start = raw.find("{")
+    if start == -1:
         raise ValueError("Model did not return a recognizable JSON object.")
-    return json.loads(match.group())
+
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(raw)):
+        ch = raw[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return raw[start:i + 1]
+
+    raise ValueError("Model's JSON object was truncated (no matching closing brace).")
+
+
+def _extract_json(raw: str) -> dict:
+    blob = _find_json_object(raw)
+    try:
+        return json.loads(blob)
+    except json.JSONDecodeError:
+        # Ollama models frequently produce near-valid JSON -- a missing
+        # comma between two question objects, a trailing comma, an
+        # unescaped quote inside a question string. Rather than let one
+        # such slip abort the whole paper, try to repair it before
+        # giving up.
+        try:
+            from json_repair import repair_json
+        except ImportError:
+            raise  # re-raise the original JSONDecodeError if repair isn't installed
+        repaired = repair_json(blob)
+        return json.loads(repaired)
 
 
 def generate_question_paper(
