@@ -25,6 +25,13 @@ students by default.
 """
 import streamlit as st
 
+from features.question_paper_generator import (
+    generate_question_paper,
+    estimate_total_marks,
+    MAX_COUNT_PER_TYPE,
+    MAX_TOTAL_QUESTIONS,
+)
+
 from core.bridge_client import (
     list_papers,
     get_paper,
@@ -33,7 +40,6 @@ from core.bridge_client import (
     BridgeUnavailableError,
     BridgeRequestError,
 )
-from features.question_paper_generator import generate_question_paper
 
 TIMER_PRESETS = {
     "15 minutes": 15 * 60,
@@ -96,11 +102,57 @@ def _render_generate_form(username: str, active_subject: str, active_chapter: st
             value=f"{active_chapter} — Question Paper",
             key="qp_gen_title",
         )
-        total_marks_target = st.number_input(
-            "Target total marks:", min_value=10, max_value=100, value=40, step=5, key="qp_gen_marks"
-        )
+
+        st.markdown("**Choose how many of each question type:**")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            n_vsa = st.number_input(
+                "Very Short Answer (1 mark)", min_value=0, max_value=MAX_COUNT_PER_TYPE,
+                value=10, step=1, key="qp_gen_n_vsa",
+            )
+            n_sa = st.number_input(
+                "Short Answer (3 marks)", min_value=0, max_value=MAX_COUNT_PER_TYPE,
+                value=6, step=1, key="qp_gen_n_sa",
+            )
+        with col2:
+            n_fill = st.number_input(
+                "Fill in the Blanks (3 marks)", min_value=0, max_value=MAX_COUNT_PER_TYPE,
+                value=4, step=1, key="qp_gen_n_fill",
+            )
+            n_ar = st.number_input(
+                "Assertion-Reason (3 marks)", min_value=0, max_value=MAX_COUNT_PER_TYPE,
+                value=4, step=1, key="qp_gen_n_ar",
+            )
+        with col3:
+            n_la = st.number_input(
+                "Long Answer (5 marks)", min_value=0, max_value=MAX_COUNT_PER_TYPE,
+                value=6, step=1, key="qp_gen_n_la",
+            )
+            n_case = st.number_input(
+                "Case-Based (~9 marks, 3 sub-Qs)", min_value=0, max_value=MAX_COUNT_PER_TYPE,
+                value=4, step=1, key="qp_gen_n_case",
+            )
+
+        question_counts = {
+            "vsa": n_vsa, "sa": n_sa, "fill_blank": n_fill,
+            "assertion_reason": n_ar, "la": n_la, "case_based": n_case,
+        }
+        total_questions = sum(question_counts.values())
+        est_marks = estimate_total_marks(question_counts)
+        st.caption(f"≈ {total_questions} question(s), ≈ {est_marks} total marks")
+
+        if total_questions > MAX_TOTAL_QUESTIONS:
+            st.warning(
+                f"That's {total_questions} questions total -- more than {MAX_TOTAL_QUESTIONS} "
+                f"can reliably be generated in one go. Reduce a count above, or generate a second "
+                f"paper for the rest."
+            )
 
         if st.button("🚀 Generate Paper", type="primary", key="qp_gen_button"):
+            if total_questions == 0:
+                st.error("Pick at least one question of some type before generating.")
+                return
+
             with st.spinner("Building your question paper... this can take a minute."):
                 try:
                     result = generate_question_paper(
@@ -108,7 +160,7 @@ def _render_generate_form(username: str, active_subject: str, active_chapter: st
                         subject=active_subject,
                         chapter=active_chapter,
                         title=title,
-                        total_marks_target=total_marks_target,
+                        question_counts=question_counts,
                         lang=target_language,
                     )
                 except ValueError as e:
@@ -125,7 +177,6 @@ def _render_generate_form(username: str, active_subject: str, active_chapter: st
             if result["questions_skipped"]:
                 st.caption(f"({result['questions_added']} questions added, {result['questions_skipped']} skipped for not matching the expected format.)")
             st.rerun()
-
 
 def _render_setup_screen(username: str, active_subject: str, active_chapter: str, target_language: str):
     _render_generate_form(username, active_subject, active_chapter, target_language)
