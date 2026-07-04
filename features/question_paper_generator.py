@@ -7,9 +7,9 @@ reason mixed together, matching the schema storage_bridge.py's
 question_papers/paper_sections/paper_questions tables expect.
 
 Design mirrors features/study_materials.py: get_llm(), a single prompt
-asking for JSON back, then a regex pull of the JSON blob out of
-whatever chatty wrapper text the model adds around it (Ollama models are
-inconsistent about actually returning bare JSON even when told to).
+asking for JSON back, then a brace-depth extraction of the JSON blob out
+of whatever chatty wrapper text the model adds around it (Ollama models
+are inconsistent about actually returning bare JSON even when told to).
 
 Unlike study_materials.py's one-shot text generators, a question paper
 has real structure the bridge validates server-side (see
@@ -22,12 +22,15 @@ pass rather than failing the whole paper. A paper with a few fewer
 questions than requested is fine; a paper that errors out halfway
 through being built and leaves a half-empty shell in the DB is not.
 
-map_marking is deliberately never generated here -- the question-taking
-UI (ui/tab_question_paper.py) doesn't support answering it yet, so
-asking the model for one just guarantees a question nobody can answer.
+COUNTS ARE NOW PER-TYPE (not a single total_marks_target). The caller
+passes exactly how many of each question type they want -- e.g.
+{"vsa": 10, "sa": 6, "fill_blank": 4, "assertion_reason": 4, "la": 6,
+"case_based": 4} -- and the section plan, prompt, and total marks all
+fall out of that directly. See _validate_question_counts for the
+guardrails that keep a request from timing out the LLM call.
+
 """
 import json
-import re
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
@@ -39,67 +42,125 @@ from core.bridge_client import create_paper, add_paper_section, add_paper_questi
 # actually render an input for. case_based is a container whose
 # sub-questions must themselves be one of the SUB_QUESTION_TYPES below.
 GENERATABLE_TYPES = ("vsa", "sa", "la", "case_based", "fill_blank", "assertion_reason")
-SUB_QUESTION_TYPES = ("vsa", "sa", "la", "fill_blank", "assertion_reason")
+SUB_QUESTION_TYPES = ("vsa", "sa", "fill_blank", "assertion_reason")
 
-# Fixed marks-per-question and a target share of total_marks_target for
-# each section; question COUNT is derived from those two so the paper
-# scales to whatever total the user asked for instead of always coming
-# back with the same fixed 31-mark paper.
-SECTION_MARKS_SHARE = [
-    {"title": "Section A — Very Short Answer", "types": ["vsa"], "marks": 1, "share": 0.20},
-    {"title": "Section B — Short Answer", "types": ["sa", "fill_blank", "assertion_reason"], "marks": 3, "share": 0.35},
-    {"title": "Section C — Long Answer", "types": ["la"], "marks": 5, "share": 0.30},
-    {"title": "Section D — Case-Based", "types": ["case_based"], "marks": 4, "share": 0.15},
-]
+# Fixed marks-per-question and which section header each type falls
+# under. Marks-per-type stays fixed (matches what the bridge/UI already
+# expect within a section) -- only the COUNT per type is user-controlled.
+# case_based's "marks" here is the marks per sub-question inside it
+# (used only to estimate total marks for display -- the paper's real
+# per-question marks for case_based sub-questions come from the model,
+# same as any other sub-question).
+QUESTION_TYPE_INFO = {
+    "vsa":              {"section": "Section A — Very Short Answer", "marks": 1, "subs_per_case": 0},
+    "fill_blank":        {"section": "Section B — Short Answer",      "marks": 3, "subs_per_case": 0},
+    "assertion_reason":  {"section": "Section B — Short Answer",      "marks": 3, "subs_per_case": 0},
+    "sa":                {"section": "Section B — Short Answer",      "marks": 3, "subs_per_case": 0},
+    "la":                {"section": "Section C — Long Answer",       "marks": 5, "subs_per_case": 0},
+    "case_based":        {"section": "Section D — Case-Based",        "marks": 4, "subs_per_case": 3},
+}
+
+# Stable section ordering (A -> B -> C -> D) regardless of dict iteration order.
+_SECTION_ORDER = list(dict.fromkeys(info["section"] for info in QUESTION_TYPE_INFO.values()))
+
+# Fallback used only if the caller doesn't specify counts at all.
+DEFAULT_QUESTION_COUNTS = {
+    "vsa": 10, "sa": 6, "fill_blank": 4, "assertion_reason": 4, "la": 6, "case_based": 4,
+}
+
+# Guardrails. Ollama running locally on an M-series Mac has a real
+# per-call time budget -- a request for, say, 200 LA questions in one
+# shot is much more likely to time out or get truncated mid-JSON than
+# to actually succeed, so we cap both the per-type count and the total
+# question count rather than let the UI ask for anything.
+MAX_COUNT_PER_TYPE = 25
+MAX_TOTAL_QUESTIONS = 60
 
 
-def _build_section_plan(total_marks_target: int) -> list:
-    plan = []
-    for sec in SECTION_MARKS_SHARE:
-        section_marks = max(sec["marks"], round(total_marks_target * sec["share"]))
-        count = max(1, round(section_marks / sec["marks"]))
-        plan.append({"title": sec["title"], "types": sec["types"], "marks": sec["marks"], "count": count})
-    return plan
-
-
-def _validate_question_extra_clientside(qtype: str, extra: dict) -> bool:
+def estimate_total_marks(question_counts: dict) -> int:
     """
-    Mirrors storage_bridge.py's _validate_question_extra -- checked here
-    first so a malformed question from the LLM gets silently dropped
-    instead of taking down the whole /papers/add_question call with a
-    400 partway through building the paper.
+    Rough total marks a given question_counts dict would produce.
+    case_based marks are approximated as subs_per_case * marks-per-sub
+    (using the sub's own type marks would be more exact, but this
+    module doesn't ask the caller to specify sub-types, only that each
+    case has ~3 sub-questions worth ~3 marks each by convention).
     """
-    extra = extra or {}
+    total = 0
+    for qtype, count in (question_counts or {}).items():
+        info = QUESTION_TYPE_INFO.get(qtype)
+        if not info or not count:
+            continue
+        if qtype == "case_based":
+            total += count * info["subs_per_case"] * 3  # ~3 marks per sub-question
+        else:
+            total += count * info["marks"]
+    return total
 
-    if qtype in ("vsa", "sa", "la"):
-        return True
 
-    if qtype == "case_based":
-        return isinstance(extra.get("passage"), str) and bool(extra["passage"].strip())
+def _validate_question_counts(question_counts: dict) -> dict:
+    """
+    Cleans and bounds the requested counts before anything is sent to
+    the LLM. Raises ValueError for a request that's empty or too large
+    to reasonably generate in one call; silently clamps individual
+    per-type counts that exceed MAX_COUNT_PER_TYPE rather than
+    rejecting the whole request over one oversized field.
+    """
+    if not question_counts:
+        raise ValueError("No question counts provided.")
 
-    if qtype == "fill_blank":
-        text = extra.get("text_with_blanks")
-        blanks = extra.get("blanks")
-        if not text or not isinstance(text, str):
-            return False
-        if not blanks or not isinstance(blanks, list) or not all(isinstance(b, str) for b in blanks):
-            return False
-        return text.count("___") == len(blanks)
+    cleaned = {}
+    for qtype, count in question_counts.items():
+        if qtype not in QUESTION_TYPE_INFO:
+            continue
+        try:
+            count = int(count)
+        except (TypeError, ValueError):
+            continue
+        if count <= 0:
+            continue
+        cleaned[qtype] = min(count, MAX_COUNT_PER_TYPE)
 
-    if qtype == "assertion_reason":
-        for field in ("assertion", "reason", "correct_option"):
-            if not extra.get(field):
-                return False
-        return extra["correct_option"] in ("A", "B", "C", "D")
+    if not cleaned:
+        raise ValueError("At least one question type needs a count greater than 0.")
 
-    return False  # map_marking or anything unrecognized -- never accepted here
+    total_questions = sum(cleaned.values())
+    if total_questions > MAX_TOTAL_QUESTIONS:
+        raise ValueError(
+            f"That's {total_questions} questions total, which is more than this can reliably "
+            f"generate in one go (max {MAX_TOTAL_QUESTIONS}). Try a smaller paper, or generate "
+            f"a second paper for the rest."
+        )
+
+    return cleaned
+
+
+def _build_section_plan(question_counts: dict) -> list:
+    """
+    Turns {"vsa": 10, "sa": 6, ...} into the section-plan shape the
+    prompt builder and generator expect: one entry per section, each
+    listing its own types with individual counts and marks. Types with
+    a count of 0 (or omitted) are simply left out of the plan.
+    """
+    sections = {}
+    for qtype, count in question_counts.items():
+        info = QUESTION_TYPE_INFO[qtype]
+        sec = sections.setdefault(info["section"], {"title": info["section"], "items": []})
+        sec["items"].append({"type": qtype, "marks": info["marks"], "count": count})
+
+    return [sections[title] for title in _SECTION_ORDER if title in sections]
 
 
 def _build_prompt(chapter_text: str, chapter: str, language: str, section_plan: list) -> str:
-    plan_lines = [
-        f'- "{sec["title"]}": {sec["count"]} question(s), {sec["marks"]} marks each, type one of {sec["types"]}'
-        for sec in section_plan
-    ]
+    plan_lines = []
+    for sec in section_plan:
+        for item in sec["items"]:
+            marks_note = (
+                f'{item["marks"]} marks per sub-question (~{item["marks"]} x 3 sub-questions each)'
+                if item["type"] == "case_based" else f'{item["marks"]} marks each'
+            )
+            plan_lines.append(
+                f'- "{sec["title"]}": {item["count"]} question(s) of type "{item["type"]}", {marks_note}'
+            )
     plan_text = "\n".join(plan_lines)
 
     return f"""You are writing a formal, section-based exam question paper for the chapter "{chapter}",
@@ -118,12 +179,12 @@ Return ONLY a JSON object, no other text, matching this exact shape:
       "questions": [
         {{
           "type": "vsa" | "sa" | "la" | "fill_blank" | "assertion_reason" | "case_based",
-          "marks": <number, matching the plan above>,
+          "marks": <number, matching the plan above -- 0 for case_based>,
           "question_text": "<the question, OR null for fill_blank/assertion_reason/case_based>",
           "extra": <see rules below, or null>,
           "sub_questions": [ <ONLY for case_based -- 2 or 3 questions of type vsa/sa/fill_blank/assertion_reason,
                                each shaped exactly like a normal question object above, WITHOUT nested
-                               sub_questions of their own> ]
+                               sub_questions of their own, each with its OWN "marks" field> ]
         }}
       ]
     }}
@@ -138,6 +199,9 @@ Rules for "extra" by type:
 - case_based: extra = {{"passage": "<a short paragraph the sub_questions are based on>"}}, question_text = null,
   marks = 0 (the real marks live on each sub_question), and sub_questions must be present and non-empty.
 
+IMPORTANT: match the requested COUNT of each question type exactly. Do not add extra questions of a
+type that wasn't requested, and do not omit a type that was requested with a count greater than 0.
+
 Chapter text:
 {chapter_text}"""
 
@@ -145,7 +209,7 @@ Chapter text:
 def _find_json_object(raw: str) -> str:
     """
     Finds the outermost {...} block by brace-depth counting rather than a
-    greedy regex. A greedy `\{.*\}` grabs from the FIRST `{` to the LAST
+    greedy regex. A greedy `\\{.*\\}` grabs from the FIRST `{` to the LAST
     `}` in the whole response -- if the model appends any chatty text
     with its own stray braces after the real JSON, that regex silently
     stitches unrelated text into the "JSON" it hands to json.loads(),
@@ -199,33 +263,73 @@ def _extract_json(raw: str) -> dict:
         return json.loads(repaired)
 
 
+def _validate_question_extra_clientside(qtype: str, extra: dict) -> bool:
+    """
+    Mirrors storage_bridge.py's _validate_question_extra -- checked here
+    first so a malformed question from the LLM gets silently dropped
+    instead of taking down the whole /papers/add_question call with a
+    400 partway through building the paper.
+    """
+    extra = extra or {}
+
+    if qtype in ("vsa", "sa", "la"):
+        return True
+
+    if qtype == "case_based":
+        return isinstance(extra.get("passage"), str) and bool(extra["passage"].strip())
+
+    if qtype == "fill_blank":
+        text = extra.get("text_with_blanks")
+        blanks = extra.get("blanks")
+        if not text or not isinstance(text, str):
+            return False
+        if not blanks or not isinstance(blanks, list) or not all(isinstance(b, str) for b in blanks):
+            return False
+        return text.count("___") == len(blanks)
+
+    if qtype == "assertion_reason":
+        for field in ("assertion", "reason", "correct_option"):
+            if not extra.get(field):
+                return False
+        return extra["correct_option"] in ("A", "B", "C", "D")
+
+    return False  # map_marking or anything unrecognized -- never accepted here
+
+
 def generate_question_paper(
     username: str,
     subject: str,
     chapter: str,
     title: str,
-    total_marks_target: int = 40,
+    question_counts: dict = None,
     lang: str = "English",
-    section_plan: list = None,
 ) -> dict:
     """
     Generates a question paper for `chapter` and writes it into the bridge
     DB via create_paper/add_paper_section/add_paper_question, ready to be
     listed and taken immediately -- no publish step.
 
-    Returns {"paper_id": int, "title": str, "subject": str|None,
-             "questions_added": int, "questions_skipped": int}.
+    `question_counts` is a dict of {question_type: count}, e.g.
+    {"vsa": 10, "sa": 6, "fill_blank": 4, "assertion_reason": 4,
+     "la": 6, "case_based": 4}. Omitted or falsy counts mean "don't
+    include this type." Falls back to DEFAULT_QUESTION_COUNTS if None.
 
-    Raises ValueError if the chapter text is missing, the LLM is
-    unreachable, or its response couldn't be turned into any valid
-    questions at all. Raises BridgeRequestError/BridgeUnavailableError
-    only for the initial paper-shell creation call -- there's no point
-    generating content if we can't even open the shell. Once the shell
-    exists, individual bad questions are skipped rather than raised,
-    since one malformed question from the LLM shouldn't blow away an
-    otherwise-good paper that's already partially built.
+    Returns {"paper_id": int, "title": str, "subject": str|None,
+             "questions_added": int, "questions_skipped": int,
+             "estimated_total_marks": int}.
+
+    Raises ValueError if question_counts is invalid/empty/too large, the
+    chapter text is missing, the LLM is unreachable, or its response
+    couldn't be turned into any valid questions at all. Raises
+    BridgeRequestError/BridgeUnavailableError only for the initial
+    paper-shell creation call -- there's no point generating content if
+    we can't even open the shell. Once the shell exists, individual bad
+    questions are skipped rather than raised, since one malformed
+    question from the LLM shouldn't blow away an otherwise-good paper
+    that's already partially built.
     """
-    plan = section_plan or _build_section_plan(total_marks_target)
+    cleaned_counts = _validate_question_counts(question_counts or DEFAULT_QUESTION_COUNTS)
+    plan = _build_section_plan(cleaned_counts)
 
     chapter_text = get_chapter_text(username, subject, chapter)
     if not chapter_text:
@@ -354,4 +458,5 @@ def generate_question_paper(
         "subject": created.get("subject"),
         "questions_added": questions_added,
         "questions_skipped": questions_skipped,
+        "estimated_total_marks": estimate_total_marks(cleaned_counts),
     }
