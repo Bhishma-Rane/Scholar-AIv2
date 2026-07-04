@@ -294,6 +294,19 @@ def _render_answer_input(question: dict, idx: int):
             key=f"qp_input_{idx}_ar",
         )
         st.session_state.qp_answers[qid] = {"question_id": qid, "answer_option": choice}
+        
+    elif qtype == "mcq":
+        extra = question.get("extra") or {}
+        options = extra.get("options", [])
+        current = existing.get("answer_option")
+        choice = st.radio(
+            "Choose the correct option:",
+            range(len(options)),
+            index=current if isinstance(current, int) else None,
+            format_func=lambda i: options[i],
+            key=f"qp_input_{idx}_mcq",
+        )
+        st.session_state.qp_answers[qid] = {"question_id": qid, "answer_option": choice}
 
     else:
         st.warning(f"This question type ({qtype}) isn't supported in this view yet.")
