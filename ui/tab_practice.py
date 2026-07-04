@@ -14,8 +14,11 @@ REPLACES the old split across three tabs:
     features/mock_exams.py is no longer called from anywhere; the
     function can stay in that file unused or be deleted, your call.
   - Assessment tab -> now the "Take Quiz" sub-tab here (unchanged logic).
-  - Question Paper tab -> now the "Question Paper" sub-tab here
-    (unchanged logic, just nested).
+  - Question Paper tab -> now the "Question Paper" sub-tab here. Users
+    generate their own papers on demand from this tab now -- see
+    ui/tab_question_paper.py -- rather than picking from an
+    admin-published list, so it needs active_subject/active_chapter
+    passed through in addition to username/target_language.
 """
 import os
 import json
@@ -232,4 +235,4 @@ def render_practice_tab(username: str, active_subject: str, active_chapter: str,
         _render_take_quiz_subtab(username, active_subject, active_chapter, target_language)
 
     with paper_subtab:
-        render_question_paper_tab(username, target_language)
+        render_question_paper_tab(username, active_subject, active_chapter, target_language)
