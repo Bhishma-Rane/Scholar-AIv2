@@ -1,11 +1,11 @@
 """
 ui/tab_question_paper.py
 ===========================
-The "Question Paper" tab: browse published question papers, choose
-Practice or Test mode (Test mode adds a customizable timer), answer
-questions one at a time (VSA, SA, LA, case-based, fill-in-the-blanks,
-assertion-reason -- map-marking comes in a later update), and see a
-graded results screen on submit.
+The "Question Paper" tab: generate a question paper on demand for the
+active chapter, choose Practice or Test mode (Test mode adds a
+customizable timer), answer questions one at a time (VSA, SA, LA,
+case-based, fill-in-the-blanks, assertion-reason -- map-marking comes
+in a later update), and see a graded results screen on submit.
 
 Structured the same way as ui/tab_assessment.py: a setup screen, a
 question-by-question screen, and a results screen, switched between via
@@ -17,6 +17,11 @@ NOTE: map_marking questions are skipped in the question list for now
 click-on-image widget is built. If a paper contains ONLY a map_marking
 question in some section, that section will simply show no questions,
 which is expected for now.
+
+NOTE on ownership: there's no publish/draft step. Every paper belongs
+to the username that generated it and shows up in their own list the
+moment it's created -- nothing to approve, nothing shared between
+students by default.
 """
 import streamlit as st
 
@@ -28,6 +33,7 @@ from core.bridge_client import (
     BridgeUnavailableError,
     BridgeRequestError,
 )
+from features.question_paper_generator import generate_question_paper
 
 TIMER_PRESETS = {
     "15 minutes": 15 * 60,
@@ -77,9 +83,50 @@ def _flatten_questions(paper: dict) -> list:
     return flat
 
 
-def _render_setup_screen(username: str):
+def _render_generate_form(username: str, active_subject: str, active_chapter: str, target_language: str):
+    """Lets the user generate a fresh question paper for the active chapter
+    on demand -- no admin step in between, it's usable the moment it's built."""
+    with st.expander("➕ Generate a new question paper", expanded=False):
+        if active_chapter == "Select Chapter":
+            st.warning("Select a chapter first to generate a paper from it.")
+            return
+
+        title = st.text_input(
+            "Paper title:",
+            value=f"{active_chapter} — Question Paper",
+            key="qp_gen_title",
+        )
+        total_marks_target = st.number_input(
+            "Target total marks:", min_value=10, max_value=100, value=40, step=5, key="qp_gen_marks"
+        )
+
+        if st.button("🚀 Generate Paper", type="primary", key="qp_gen_button"):
+            with st.spinner("Building your question paper... this can take a minute."):
+                try:
+                    result = generate_question_paper(
+                        username=username,
+                        subject=active_subject,
+                        chapter=active_chapter,
+                        title=title,
+                        total_marks_target=total_marks_target,
+                        lang=target_language,
+                    )
+                except BridgeRequestError as e:
+                    st.error(f"Couldn't generate this paper: {e.detail}")
+                    return
+                except BridgeUnavailableError:
+                    st.error("Can't reach the account server right now. Please try again in a moment.")
+                    return
+
+            st.success(f"Generated \"{result['title']}\"! Pick it from the list below to start.")
+            st.rerun()
+
+
+def _render_setup_screen(username: str, active_subject: str, active_chapter: str, target_language: str):
+    _render_generate_form(username, active_subject, active_chapter, target_language)
+
     try:
-        papers = list_papers(published_only=True)
+        papers = list_papers(username=username)
     except BridgeRequestError as e:
         st.error(f"Couldn't load question papers: {e.detail}")
         return
@@ -88,12 +135,12 @@ def _render_setup_screen(username: str):
         return
 
     if not papers:
-        st.info("No question papers have been published yet.")
+        st.info("You haven't generated any question papers yet -- use \"Generate a new question paper\" above to create one.")
         return
 
     paper_labels = [f"{p['title']} ({p.get('subject') or 'General'}) — {p['total_marks']} marks" for p in papers]
     selected_idx = st.selectbox(
-        "Choose a question paper:",
+        "Choose one of your question papers:",
         range(len(papers)),
         format_func=lambda i: paper_labels[i],
         key="qp_selected_paper_idx",
@@ -312,7 +359,7 @@ def _render_results_screen(username: str, target_language: str):
         st.rerun()
 
 
-def render_question_paper_tab(username: str, target_language: str = "English"):
+def render_question_paper_tab(username: str, active_subject: str = None, active_chapter: str = None, target_language: str = "English"):
     st.header("📝 Question Paper")
 
     if "qp_active" not in st.session_state:
@@ -321,7 +368,7 @@ def render_question_paper_tab(username: str, target_language: str = "English"):
         st.session_state.qp_submitted = False
 
     if not st.session_state.qp_active:
-        _render_setup_screen(username)
+        _render_setup_screen(username, active_subject, active_chapter, target_language)
     elif not st.session_state.qp_submitted:
         _render_question_screen()
     else:
