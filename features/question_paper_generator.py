@@ -29,6 +29,9 @@ passes exactly how many of each question type they want -- e.g.
 fall out of that directly. See _validate_question_counts for the
 guardrails that keep a request from timing out the LLM call.
 
+map_marking is deliberately never generated here -- the question-taking
+UI (ui/tab_question_paper.py) doesn't support answering it yet, so
+asking the model for one just guarantees a question nobody can answer.
 """
 import json
 
@@ -41,31 +44,38 @@ from core.bridge_client import create_paper, add_paper_section, add_paper_questi
 # The five types the in-app answer screen (ui/tab_question_paper.py) can
 # actually render an input for. case_based is a container whose
 # sub-questions must themselves be one of the SUB_QUESTION_TYPES below.
-GENERATABLE_TYPES = ("vsa", "sa", "la", "case_based", "fill_blank", "assertion_reason")
-SUB_QUESTION_TYPES = ("vsa", "sa", "fill_blank", "assertion_reason")
+GENERATABLE_TYPES = ("mcq", "vsa", "sa", "la", "case_based", "fill_blank", "assertion_reason")
+SUB_QUESTION_TYPES = ("mcq", "vsa", "sa", "fill_blank", "assertion_reason")
 
 # Fixed marks-per-question and which section header each type falls
-# under. Marks-per-type stays fixed (matches what the bridge/UI already
-# expect within a section) -- only the COUNT per type is user-controlled.
-# case_based's "marks" here is the marks per sub-question inside it
-# (used only to estimate total marks for display -- the paper's real
-# per-question marks for case_based sub-questions come from the model,
-# same as any other sub-question).
+# under, following a CBSE-style layout:
+#   Section A (1 mark each):  mcq, fill_blank, assertion_reason, vsa
+#   Section B (2 marks):      sa
+#   Section C (4 marks):      la_long   (bridge type "la", just a lower mark tier)
+#   Section D (5 marks):      la_vlong  (bridge type "la", higher mark tier)
+#   Section E (4 marks total, split 1+1+2 across 3 sub-questions): case_based
+#
+# "bridge_type" is the type string actually sent to storage_bridge.py --
+# la_long/la_vlong are both plain "la" server-side, they only differ in
+# marks and which section/count the UI exposes them under.
 QUESTION_TYPE_INFO = {
-    "vsa":              {"section": "Section A — Very Short Answer", "marks": 1, "subs_per_case": 0},
-    "fill_blank":        {"section": "Section B — Short Answer",      "marks": 3, "subs_per_case": 0},
-    "assertion_reason":  {"section": "Section B — Short Answer",      "marks": 3, "subs_per_case": 0},
-    "sa":                {"section": "Section B — Short Answer",      "marks": 3, "subs_per_case": 0},
-    "la":                {"section": "Section C — Long Answer",       "marks": 5, "subs_per_case": 0},
-    "case_based":        {"section": "Section D — Case-Based",        "marks": 4, "subs_per_case": 3},
+    "mcq":               {"section": "Section A — MCQ, Fill-Ups, A-R & VSA", "marks": 1, "bridge_type": "mcq"},
+    "fill_blank":        {"section": "Section A — MCQ, Fill-Ups, A-R & VSA", "marks": 1, "bridge_type": "fill_blank"},
+    "assertion_reason":  {"section": "Section A — MCQ, Fill-Ups, A-R & VSA", "marks": 1, "bridge_type": "assertion_reason"},
+    "vsa":               {"section": "Section A — MCQ, Fill-Ups, A-R & VSA", "marks": 1, "bridge_type": "vsa"},
+    "sa":                {"section": "Section B — Short Answer",            "marks": 2, "bridge_type": "sa"},
+    "la_long":           {"section": "Section C — Long Answer",             "marks": 4, "bridge_type": "la"},
+    "la_vlong":          {"section": "Section D — Very Long Answer",        "marks": 5, "bridge_type": "la"},
+    "case_based":        {"section": "Section E — Case-Based",              "marks": 4, "bridge_type": "case_based", "sub_marks": [1, 1, 2]},
 }
 
-# Stable section ordering (A -> B -> C -> D) regardless of dict iteration order.
+# Stable section ordering (A -> B -> C -> D -> E) regardless of dict iteration order.
 _SECTION_ORDER = list(dict.fromkeys(info["section"] for info in QUESTION_TYPE_INFO.values()))
 
 # Fallback used only if the caller doesn't specify counts at all.
 DEFAULT_QUESTION_COUNTS = {
-    "vsa": 10, "sa": 6, "fill_blank": 4, "assertion_reason": 4, "la": 6, "case_based": 4,
+    "mcq": 6, "fill_blank": 4, "assertion_reason": 4, "vsa": 6,
+    "sa": 6, "la_long": 4, "la_vlong": 4, "case_based": 4,
 }
 
 # Guardrails. Ollama running locally on an M-series Mac has a real
@@ -79,11 +89,9 @@ MAX_TOTAL_QUESTIONS = 60
 
 def estimate_total_marks(question_counts: dict) -> int:
     """
-    Rough total marks a given question_counts dict would produce.
-    case_based marks are approximated as subs_per_case * marks-per-sub
-    (using the sub's own type marks would be more exact, but this
-    module doesn't ask the caller to specify sub-types, only that each
-    case has ~3 sub-questions worth ~3 marks each by convention).
+    Exact total marks a given question_counts dict would produce.
+    case_based marks come from the fixed sub_marks split (1+1+2=4 per
+    case), since each case is generated with that exact structure.
     """
     total = 0
     for qtype, count in (question_counts or {}).items():
@@ -91,7 +99,7 @@ def estimate_total_marks(question_counts: dict) -> int:
         if not info or not count:
             continue
         if qtype == "case_based":
-            total += count * info["subs_per_case"] * 3  # ~3 marks per sub-question
+            total += count * sum(info["sub_marks"])
         else:
             total += count * info["marks"]
     return total
@@ -136,16 +144,26 @@ def _validate_question_counts(question_counts: dict) -> dict:
 
 def _build_section_plan(question_counts: dict) -> list:
     """
-    Turns {"vsa": 10, "sa": 6, ...} into the section-plan shape the
+    Turns {"mcq": 6, "sa": 6, ...} into the section-plan shape the
     prompt builder and generator expect: one entry per section, each
-    listing its own types with individual counts and marks. Types with
-    a count of 0 (or omitted) are simply left out of the plan.
+    listing its own types (labelled with their bridge_type so the
+    model/bridge see plain "la", not "la_long"/"la_vlong") with
+    individual counts and marks. Types with a count of 0 (or omitted)
+    are simply left out of the plan.
     """
     sections = {}
     for qtype, count in question_counts.items():
         info = QUESTION_TYPE_INFO[qtype]
         sec = sections.setdefault(info["section"], {"title": info["section"], "items": []})
-        sec["items"].append({"type": qtype, "marks": info["marks"], "count": count})
+        item = {
+            "label": qtype,                      # what the UI/caller called it (la_long, la_vlong, etc.)
+            "type": info["bridge_type"],          # what actually gets sent to the bridge (la, mcq, ...)
+            "marks": info["marks"],
+            "count": count,
+        }
+        if qtype == "case_based":
+            item["sub_marks"] = info["sub_marks"]
+        sec["items"].append(item)
 
     return [sections[title] for title in _SECTION_ORDER if title in sections]
 
@@ -154,10 +172,10 @@ def _build_prompt(chapter_text: str, chapter: str, language: str, section_plan: 
     plan_lines = []
     for sec in section_plan:
         for item in sec["items"]:
-            marks_note = (
-                f'{item["marks"]} marks per sub-question (~{item["marks"]} x 3 sub-questions each)'
-                if item["type"] == "case_based" else f'{item["marks"]} marks each'
-            )
+            if item["type"] == "case_based":
+                marks_note = f'a passage with exactly 3 sub-questions worth {item["sub_marks"][0]}, {item["sub_marks"][1]}, and {item["sub_marks"][2]} marks (in that order)'
+            else:
+                marks_note = f'{item["marks"]} marks each'
             plan_lines.append(
                 f'- "{sec["title"]}": {item["count"]} question(s) of type "{item["type"]}", {marks_note}'
             )
@@ -178,13 +196,14 @@ Return ONLY a JSON object, no other text, matching this exact shape:
       "instructions": "<one short line of instructions for this section, e.g. 'Answer all questions.'>",
       "questions": [
         {{
-          "type": "vsa" | "sa" | "la" | "fill_blank" | "assertion_reason" | "case_based",
+          "type": "mcq" | "vsa" | "sa" | "la" | "fill_blank" | "assertion_reason" | "case_based",
           "marks": <number, matching the plan above -- 0 for case_based>,
           "question_text": "<the question, OR null for fill_blank/assertion_reason/case_based>",
           "extra": <see rules below, or null>,
-          "sub_questions": [ <ONLY for case_based -- 2 or 3 questions of type vsa/sa/fill_blank/assertion_reason,
+          "sub_questions": [ <ONLY for case_based -- EXACTLY 3 questions of type vsa/sa/mcq/fill_blank/assertion_reason,
                                each shaped exactly like a normal question object above, WITHOUT nested
-                               sub_questions of their own, each with its OWN "marks" field> ]
+                               sub_questions of their own, with "marks" set to the exact sequence given in the
+                               plan above (e.g. 1, then 1, then 2)> ]
         }}
       ]
     }}
@@ -193,11 +212,13 @@ Return ONLY a JSON object, no other text, matching this exact shape:
 
 Rules for "extra" by type:
 - vsa / sa / la: extra must be null.
+- mcq: extra = {{"options": ["<option 1>", "<option 2>", "<option 3>", "<option 4>"], "correct_option": <integer index 0-3 of the correct option>}}.
+  Always provide exactly 4 options.
 - fill_blank: extra = {{"text_with_blanks": "<sentence with blanks marked as ___>", "blanks": ["<answer for each ___, in order>"]}}.
   The number of "___" markers MUST exactly equal the number of items in "blanks".
 - assertion_reason: extra = {{"assertion": "<statement A>", "reason": "<statement R>", "correct_option": "A"|"B"|"C"|"D"}}.
 - case_based: extra = {{"passage": "<a short paragraph the sub_questions are based on>"}}, question_text = null,
-  marks = 0 (the real marks live on each sub_question), and sub_questions must be present and non-empty.
+  marks = 0 (the real marks live on each sub_question), and sub_questions must be present with exactly 3 entries.
 
 IMPORTANT: match the requested COUNT of each question type exactly. Do not add extra questions of a
 type that wasn't requested, and do not omit a type that was requested with a count greater than 0.
@@ -292,6 +313,15 @@ def _validate_question_extra_clientside(qtype: str, extra: dict) -> bool:
             if not extra.get(field):
                 return False
         return extra["correct_option"] in ("A", "B", "C", "D")
+
+    if qtype == "mcq":
+        options = extra.get("options")
+        correct = extra.get("correct_option")
+        if not options or not isinstance(options, list) or len(options) < 2:
+            return False
+        if not all(isinstance(o, str) and o.strip() for o in options):
+            return False
+        return isinstance(correct, int) and 0 <= correct < len(options)
 
     return False  # map_marking or anything unrecognized -- never accepted here
 
@@ -434,7 +464,7 @@ def generate_question_paper(
             if not _validate_question_extra_clientside(qtype, extra):
                 questions_skipped += 1
                 continue
-            if qtype in ("vsa", "sa", "la") and not question_text:
+            if qtype in ("mcq", "vsa", "sa", "la") and not question_text:
                 questions_skipped += 1
                 continue
 
