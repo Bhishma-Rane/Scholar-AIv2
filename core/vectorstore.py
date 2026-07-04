@@ -16,11 +16,22 @@ The temp scratch directory is cleaned up after use. ChromaDB itself
 (paths["chroma"]) is still rebuilt and cached locally on Streamlit
 Cloud's container disk — that part is unchanged. It just gets rebuilt
 from bridge-fetched files instead of a local "sources" folder.
+
+FIX (readonly database on force_rebuild): chromadb caches a process-level
+System client keyed by persist_directory path (see
+chromadb.api.client.SharedSystemClient). Since Streamlit Cloud reuses the
+same worker process across reruns, doing shutil.rmtree() on chroma_db_dir
+and then immediately reopening Chroma at the SAME path returns a stale
+cached client pointing at a now-deleted sqlite file, causing
+"attempt to write a readonly database" (SQLITE_READONLY_DBMOVED) on the
+next write. Clearing the cache right after rmtree forces a genuinely
+fresh client to be opened. See get_vector_store() below.
 """
 import os
 import shutil
 import tempfile
 
+from chromadb.api.client import SharedSystemClient
 from langchain_community.vectorstores import Chroma
 from langchain_ollama import OllamaEmbeddings
 from langchain_community.document_loaders import TextLoader, PyPDFLoader
@@ -81,6 +92,10 @@ def get_vector_store(username: str, subject: str, force_rebuild: bool = False):
 
     if force_rebuild and os.path.exists(chroma_db_dir):
         shutil.rmtree(chroma_db_dir)
+        # Force chromadb to drop its cached System client for this path,
+        # otherwise the next Chroma(...) call below reuses a stale client
+        # still pointing at the sqlite file we just deleted.
+        SharedSystemClient.clear_system_cache()
 
     if not force_rebuild and os.path.exists(chroma_db_dir) and os.listdir(chroma_db_dir):
         return Chroma(persist_directory=chroma_db_dir, embedding_function=embeddings)
