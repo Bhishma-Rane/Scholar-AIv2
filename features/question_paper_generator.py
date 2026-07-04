@@ -29,9 +29,6 @@ passes exactly how many of each question type they want -- e.g.
 fall out of that directly. See _validate_question_counts for the
 guardrails that keep a request from timing out the LLM call.
 
-map_marking is deliberately never generated here -- the question-taking
-UI (ui/tab_question_paper.py) doesn't support answering it yet, so
-asking the model for one just guarantees a question nobody can answer.
 """
 import json
 
@@ -168,51 +165,59 @@ def _build_section_plan(question_counts: dict) -> list:
     return [sections[title] for title in _SECTION_ORDER if title in sections]
 
 
-def _build_section_prompt(chapter_text: str, chapter: str, language: str, section: dict) -> str:
+def _build_item_prompt(chapter_text: str, chapter: str, language: str, item: dict) -> str:
     """
-    Builds a prompt for a SINGLE section only (see generate_question_paper,
-    which now makes one LLM call per section rather than one call for the
-    whole paper). Splitting the request this way keeps each individual
-    Ollama call's response small enough to finish comfortably within the
-    "paper" model_type's timeout/num_predict budget (core/llm.py) --
-    a full 8-type paper generated in ONE call regularly exceeded even a
-    60s httpx timeout once mcq/fill_blank/A-R/vsa/sa/la_long/la_vlong/
-    case_based were all requested together.
+    Builds a prompt for a SINGLE question type only (see generate_question_paper,
+    which now makes one LLM call per TYPE, not even per section). A section
+    like "Section A" can mix 4 different types (mcq/fill_blank/A-R/vsa)
+    totalling 20 questions -- asking for all of them in one call still blew
+    past num_predict and got silently truncated to a single question (the
+    model closes the JSON early to stay syntactically valid once it runs
+    out of budget, so no error fires, you just get way fewer questions than
+    asked for). Generating one type at a time keeps each response small
+    enough to actually fit inside the "paper" model_type's token budget.
     """
-    plan_lines = []
-    for item in section["items"]:
-        if item["type"] == "case_based":
-            marks_note = f'a passage with exactly 3 sub-questions worth {item["sub_marks"][0]}, {item["sub_marks"][1]}, and {item["sub_marks"][2]} marks (in that order)'
-        else:
-            marks_note = f'{item["marks"]} marks each'
-        plan_lines.append(f'- {item["count"]} question(s) of type "{item["type"]}", {marks_note}')
-    plan_text = "\n".join(plan_lines)
+    if item["type"] == "case_based":
+        plan_line = (
+            f'Produce EXACTLY {item["count"]} case-based question(s). Each one has a short passage '
+            f'and EXACTLY 3 sub-questions worth {item["sub_marks"][0]}, {item["sub_marks"][1]}, and '
+            f'{item["sub_marks"][2]} marks (in that order).'
+        )
+        shape = """{
+  "questions": [
+    {
+      "type": "case_based",
+      "marks": 0,
+      "question_text": null,
+      "extra": {"passage": "<a short paragraph the sub_questions are based on>"},
+      "sub_questions": [
+        {"type": "vsa" | "sa" | "mcq" | "fill_blank" | "assertion_reason", "marks": <exact mark from the sequence above>, "question_text": "<...>", "extra": <per rules below>}
+      ]
+    }
+  ]
+}"""
+    else:
+        plan_line = f'Produce EXACTLY {item["count"]} question(s) of type "{item["type"]}", {item["marks"]} marks each.'
+        shape = f"""{{
+  "questions": [
+    {{
+      "type": "{item['type']}",
+      "marks": {item['marks']},
+      "question_text": "<the question, OR null for fill_blank/assertion_reason>",
+      "extra": <see rules below, or null>
+    }}
+  ]
+}}"""
 
-    return f"""You are writing ONE SECTION of a formal, section-based exam question paper for the
-chapter "{chapter}", based ONLY on the text provided below. Write all question text, passages,
-and answer choices in {language}.
+    return f"""You are writing questions for one part of a formal exam question paper for the chapter
+"{chapter}", based ONLY on the text provided below. Write all question text, passages, and answer
+choices in {language}.
 
-This section is titled "{section["title"]}". Produce EXACTLY this plan for it:
-{plan_text}
+{plan_line}
 
 Return ONLY a JSON object, no other text, matching this exact shape:
 
-{{
-  "title": "{section["title"]}",
-  "instructions": "<one short line of instructions for this section, e.g. 'Answer all questions.'>",
-  "questions": [
-    {{
-      "type": "mcq" | "vsa" | "sa" | "la" | "fill_blank" | "assertion_reason" | "case_based",
-      "marks": <number, matching the plan above -- 0 for case_based>,
-      "question_text": "<the question, OR null for fill_blank/assertion_reason/case_based>",
-      "extra": <see rules below, or null>,
-      "sub_questions": [ <ONLY for case_based -- EXACTLY 3 questions of type vsa/sa/mcq/fill_blank/assertion_reason,
-                           each shaped exactly like a normal question object above, WITHOUT nested
-                           sub_questions of their own, with "marks" set to the exact sequence given in the
-                           plan above (e.g. 1, then 1, then 2)> ]
-    }}
-  ]
-}}
+{shape}
 
 Rules for "extra" by type:
 - vsa / sa / la: extra must be null.
@@ -221,11 +226,8 @@ Rules for "extra" by type:
 - fill_blank: extra = {{"text_with_blanks": "<sentence with blanks marked as ___>", "blanks": ["<answer for each ___, in order>"]}}.
   The number of "___" markers MUST exactly equal the number of items in "blanks".
 - assertion_reason: extra = {{"assertion": "<statement A>", "reason": "<statement R>", "correct_option": "A"|"B"|"C"|"D"}}.
-- case_based: extra = {{"passage": "<a short paragraph the sub_questions are based on>"}}, question_text = null,
-  marks = 0 (the real marks live on each sub_question), and sub_questions must be present with exactly 3 entries.
 
-IMPORTANT: match the requested COUNT of each question type exactly. Do not add extra questions of a
-type that wasn't requested, and do not omit a type that was requested with a count greater than 0.
+IMPORTANT: the "questions" array must contain EXACTLY {item["count"]} item(s) -- not fewer, not more.
 
 Chapter text:
 {chapter_text}"""
@@ -274,7 +276,7 @@ def _extract_json(raw: str) -> dict:
     blob = _find_json_object(raw)
     try:
         return json.loads(blob)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
         # Ollama models frequently produce near-valid JSON -- a missing
         # comma between two question objects, a trailing comma, an
         # unescaped quote inside a question string. Rather than let one
@@ -283,7 +285,10 @@ def _extract_json(raw: str) -> dict:
         try:
             from json_repair import repair_json
         except ImportError:
-            raise  # re-raise the original JSONDecodeError if repair isn't installed
+            # json_repair isn't installed -- surface this as the same
+            # ValueError the caller already knows how to catch and show
+            # nicely, instead of an uncaught ImportError crashing the app.
+            raise ValueError(f"{e} (and json_repair isn't installed to attempt a fix)") from e
         repaired = repair_json(blob)
         return json.loads(repaired)
 
@@ -352,20 +357,23 @@ def generate_question_paper(
              "questions_added": int, "questions_skipped": int,
              "estimated_total_marks": int, "failed_sections": list[str]}.
 
-    Generation happens ONE SECTION AT A TIME (one LLM call per section,
-    e.g. a separate call each for the MCQ/VSA section, the Long Answer
-    section, the Case-Based section, etc.) rather than a single call for
-    the whole paper -- this keeps each individual Ollama call's response
-    small enough to reliably finish inside its timeout even when the
-    paper as a whole has many question types and a large total count.
-    A section whose LLM call times out or returns unusable JSON is
-    skipped (its title lands in "failed_sections") rather than aborting
-    the whole paper -- the student still gets everything that DID
-    generate successfully.
+    Generation happens ONE QUESTION TYPE AT A TIME (a separate LLM call
+    each for "6 mcq", "4 fill_blank", "4 case_based", etc.) rather than
+    one call per section or one call for the whole paper -- a section
+    can bundle up to 4 different types with a large combined count, and
+    asking for all of them in a single call still overflowed the
+    response's token budget: the model closes the JSON early to stay
+    syntactically valid once it runs out of room, so nothing errors,
+    you just silently get far fewer questions than requested. Per-type
+    calls keep each individual response small enough to reliably contain
+    the FULL requested count. A type whose call times out or returns
+    unusable JSON is skipped (its label lands in "failed_sections")
+    rather than aborting the whole paper -- the student still gets
+    everything that DID generate successfully.
 
     Raises ValueError if question_counts is invalid/empty/too large, the
     chapter text is missing, the LLM is unreachable, or literally every
-    section failed to generate. Raises BridgeRequestError/
+    question type failed to generate. Raises BridgeRequestError/
     BridgeUnavailableError only for the initial paper-shell creation
     call -- there's no point generating content if we can't even open
     the shell. Once the shell exists, individual bad questions are
@@ -382,42 +390,55 @@ def generate_question_paper(
 
     context_slice = RecursiveCharacterTextSplitter(chunk_size=12000, chunk_overlap=0).split_text(chapter_text)[0]
 
-    # "paper" model_type -- see core/llm.py -- is sized (num_predict) and
-    # timed for ONE SECTION's worth of questions per call, not the whole
-    # paper. SECTION_TIMEOUT_SECONDS is generous per-call since we're now
-    # making several smaller calls instead of one huge one; still bounded
-    # so a genuinely stuck Ollama call doesn't hang the whole request.
-    SECTION_TIMEOUT_SECONDS = 90
-    llm = get_llm(model_type="paper", request_timeout=SECTION_TIMEOUT_SECONDS)
+    # "paper" model_type -- see core/llm.py -- is sized (num_predict) for
+    # ONE TYPE's worth of questions per call. ITEM_TIMEOUT_SECONDS is per
+    # call; with up to ~8 items across the whole paper this means several
+    # small, fast calls instead of one huge one that silently truncates.
+    ITEM_TIMEOUT_SECONDS = 75
+    llm = get_llm(model_type="paper", request_timeout=ITEM_TIMEOUT_SECONDS)
     if llm is None:
         raise ValueError("Could not connect to the LLM.")
 
-    # Generate each section's questions with its own LLM call. A section
-    # that times out or returns unusable JSON is skipped entirely rather
-    # than aborting the whole paper -- e.g. if the Case-Based section
-    # fails, the student still gets a paper with everything else in it.
-    generated_sections = []
-    failed_section_titles = []
+    # Generate ONE QUESTION TYPE AT A TIME. Asking for a whole section in
+    # one call (e.g. Section A = mcq + fill_blank + assertion_reason + vsa,
+    # 20 questions total) still overflowed num_predict -- the model closes
+    # the JSON early to stay syntactically valid once it runs out of
+    # budget, so no error fires, you just silently get far fewer questions
+    # than requested. Per-type calls keep each response small enough to
+    # actually contain the full requested count. An item that times out or
+    # returns unusable JSON is skipped rather than aborting the whole
+    # paper -- the student still gets everything else that DID generate.
+    generated_sections = []  # [{"title", "instructions", "questions": [...]}]
+    failed_item_labels = []
     for section in plan:
-        section_prompt = _build_section_prompt(context_slice, chapter, lang, section)
-        raw = invoke_with_timeout(llm, section_prompt, timeout_seconds=SECTION_TIMEOUT_SECONDS)
-        if raw is None:
-            failed_section_titles.append(section["title"])
-            continue
-        try:
-            parsed_section = _extract_json(raw)
-        except (ValueError, json.JSONDecodeError):
-            failed_section_titles.append(section["title"])
-            continue
-        if not parsed_section.get("questions"):
-            failed_section_titles.append(section["title"])
-            continue
-        generated_sections.append(parsed_section)
+        section_questions = []
+        for item in section["items"]:
+            item_prompt = _build_item_prompt(context_slice, chapter, lang, item)
+            raw = invoke_with_timeout(llm, item_prompt, timeout_seconds=ITEM_TIMEOUT_SECONDS)
+            if raw is None:
+                failed_item_labels.append(item["label"])
+                continue
+            try:
+                parsed_item = _extract_json(raw)
+            except (ValueError, json.JSONDecodeError):
+                failed_item_labels.append(item["label"])
+                continue
+            questions = parsed_item.get("questions") or []
+            if not questions:
+                failed_item_labels.append(item["label"])
+                continue
+            section_questions.extend(questions)
+        if section_questions:
+            generated_sections.append({
+                "title": section["title"],
+                "instructions": "Answer all questions.",
+                "questions": section_questions,
+            })
 
     if not generated_sections:
         raise ValueError(
             "The model's response couldn't be turned into any valid questions "
-            "(every section failed or timed out). Try generating again, or with fewer questions."
+            "(every question type failed or timed out). Try generating again, or with fewer questions."
         )
 
     # Paper shell first -- if THIS call fails, nothing partial gets left behind.
@@ -526,5 +547,5 @@ def generate_question_paper(
         "questions_added": questions_added,
         "questions_skipped": questions_skipped,
         "estimated_total_marks": estimate_total_marks(cleaned_counts),
-        "failed_sections": failed_section_titles,
+        "failed_sections": failed_item_labels,
     }
