@@ -37,7 +37,7 @@ import json
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-from core.llm import get_llm
+from core.llm import get_llm, invoke_with_timeout
 from core.vectorstore import get_chapter_text
 from core.bridge_client import create_paper, add_paper_section, add_paper_question, BridgeRequestError
 
@@ -168,44 +168,48 @@ def _build_section_plan(question_counts: dict) -> list:
     return [sections[title] for title in _SECTION_ORDER if title in sections]
 
 
-def _build_prompt(chapter_text: str, chapter: str, language: str, section_plan: list) -> str:
+def _build_section_prompt(chapter_text: str, chapter: str, language: str, section: dict) -> str:
+    """
+    Builds a prompt for a SINGLE section only (see generate_question_paper,
+    which now makes one LLM call per section rather than one call for the
+    whole paper). Splitting the request this way keeps each individual
+    Ollama call's response small enough to finish comfortably within the
+    "paper" model_type's timeout/num_predict budget (core/llm.py) --
+    a full 8-type paper generated in ONE call regularly exceeded even a
+    60s httpx timeout once mcq/fill_blank/A-R/vsa/sa/la_long/la_vlong/
+    case_based were all requested together.
+    """
     plan_lines = []
-    for sec in section_plan:
-        for item in sec["items"]:
-            if item["type"] == "case_based":
-                marks_note = f'a passage with exactly 3 sub-questions worth {item["sub_marks"][0]}, {item["sub_marks"][1]}, and {item["sub_marks"][2]} marks (in that order)'
-            else:
-                marks_note = f'{item["marks"]} marks each'
-            plan_lines.append(
-                f'- "{sec["title"]}": {item["count"]} question(s) of type "{item["type"]}", {marks_note}'
-            )
+    for item in section["items"]:
+        if item["type"] == "case_based":
+            marks_note = f'a passage with exactly 3 sub-questions worth {item["sub_marks"][0]}, {item["sub_marks"][1]}, and {item["sub_marks"][2]} marks (in that order)'
+        else:
+            marks_note = f'{item["marks"]} marks each'
+        plan_lines.append(f'- {item["count"]} question(s) of type "{item["type"]}", {marks_note}')
     plan_text = "\n".join(plan_lines)
 
-    return f"""You are writing a formal, section-based exam question paper for the chapter "{chapter}",
-based ONLY on the text provided below. Write all question text, passages, and answer choices in {language}.
+    return f"""You are writing ONE SECTION of a formal, section-based exam question paper for the
+chapter "{chapter}", based ONLY on the text provided below. Write all question text, passages,
+and answer choices in {language}.
 
-Produce EXACTLY this section plan:
+This section is titled "{section["title"]}". Produce EXACTLY this plan for it:
 {plan_text}
 
 Return ONLY a JSON object, no other text, matching this exact shape:
 
 {{
-  "sections": [
+  "title": "{section["title"]}",
+  "instructions": "<one short line of instructions for this section, e.g. 'Answer all questions.'>",
+  "questions": [
     {{
-      "title": "<section title, matching the plan above exactly>",
-      "instructions": "<one short line of instructions for this section, e.g. 'Answer all questions.'>",
-      "questions": [
-        {{
-          "type": "mcq" | "vsa" | "sa" | "la" | "fill_blank" | "assertion_reason" | "case_based",
-          "marks": <number, matching the plan above -- 0 for case_based>,
-          "question_text": "<the question, OR null for fill_blank/assertion_reason/case_based>",
-          "extra": <see rules below, or null>,
-          "sub_questions": [ <ONLY for case_based -- EXACTLY 3 questions of type vsa/sa/mcq/fill_blank/assertion_reason,
-                               each shaped exactly like a normal question object above, WITHOUT nested
-                               sub_questions of their own, with "marks" set to the exact sequence given in the
-                               plan above (e.g. 1, then 1, then 2)> ]
-        }}
-      ]
+      "type": "mcq" | "vsa" | "sa" | "la" | "fill_blank" | "assertion_reason" | "case_based",
+      "marks": <number, matching the plan above -- 0 for case_based>,
+      "question_text": "<the question, OR null for fill_blank/assertion_reason/case_based>",
+      "extra": <see rules below, or null>,
+      "sub_questions": [ <ONLY for case_based -- EXACTLY 3 questions of type vsa/sa/mcq/fill_blank/assertion_reason,
+                           each shaped exactly like a normal question object above, WITHOUT nested
+                           sub_questions of their own, with "marks" set to the exact sequence given in the
+                           plan above (e.g. 1, then 1, then 2)> ]
     }}
   ]
 }}
@@ -346,17 +350,28 @@ def generate_question_paper(
 
     Returns {"paper_id": int, "title": str, "subject": str|None,
              "questions_added": int, "questions_skipped": int,
-             "estimated_total_marks": int}.
+             "estimated_total_marks": int, "failed_sections": list[str]}.
+
+    Generation happens ONE SECTION AT A TIME (one LLM call per section,
+    e.g. a separate call each for the MCQ/VSA section, the Long Answer
+    section, the Case-Based section, etc.) rather than a single call for
+    the whole paper -- this keeps each individual Ollama call's response
+    small enough to reliably finish inside its timeout even when the
+    paper as a whole has many question types and a large total count.
+    A section whose LLM call times out or returns unusable JSON is
+    skipped (its title lands in "failed_sections") rather than aborting
+    the whole paper -- the student still gets everything that DID
+    generate successfully.
 
     Raises ValueError if question_counts is invalid/empty/too large, the
-    chapter text is missing, the LLM is unreachable, or its response
-    couldn't be turned into any valid questions at all. Raises
-    BridgeRequestError/BridgeUnavailableError only for the initial
-    paper-shell creation call -- there's no point generating content if
-    we can't even open the shell. Once the shell exists, individual bad
-    questions are skipped rather than raised, since one malformed
-    question from the LLM shouldn't blow away an otherwise-good paper
-    that's already partially built.
+    chapter text is missing, the LLM is unreachable, or literally every
+    section failed to generate. Raises BridgeRequestError/
+    BridgeUnavailableError only for the initial paper-shell creation
+    call -- there's no point generating content if we can't even open
+    the shell. Once the shell exists, individual bad questions are
+    skipped rather than raised, since one malformed question from the
+    LLM shouldn't blow away an otherwise-good paper that's already
+    partially built.
     """
     cleaned_counts = _validate_question_counts(question_counts or DEFAULT_QUESTION_COUNTS)
     plan = _build_section_plan(cleaned_counts)
@@ -367,21 +382,43 @@ def generate_question_paper(
 
     context_slice = RecursiveCharacterTextSplitter(chunk_size=12000, chunk_overlap=0).split_text(chapter_text)[0]
 
-    prompt = _build_prompt(context_slice, chapter, lang, plan)
-
-    llm = get_llm()
+    # "paper" model_type -- see core/llm.py -- is sized (num_predict) and
+    # timed for ONE SECTION's worth of questions per call, not the whole
+    # paper. SECTION_TIMEOUT_SECONDS is generous per-call since we're now
+    # making several smaller calls instead of one huge one; still bounded
+    # so a genuinely stuck Ollama call doesn't hang the whole request.
+    SECTION_TIMEOUT_SECONDS = 90
+    llm = get_llm(model_type="paper", request_timeout=SECTION_TIMEOUT_SECONDS)
     if llm is None:
         raise ValueError("Could not connect to the LLM.")
 
-    raw = llm.invoke(prompt).content
-    try:
-        parsed = _extract_json(raw)
-    except (ValueError, json.JSONDecodeError) as e:
-        raise ValueError(f"Model returned an unusable response: {e}")
+    # Generate each section's questions with its own LLM call. A section
+    # that times out or returns unusable JSON is skipped entirely rather
+    # than aborting the whole paper -- e.g. if the Case-Based section
+    # fails, the student still gets a paper with everything else in it.
+    generated_sections = []
+    failed_section_titles = []
+    for section in plan:
+        section_prompt = _build_section_prompt(context_slice, chapter, lang, section)
+        raw = invoke_with_timeout(llm, section_prompt, timeout_seconds=SECTION_TIMEOUT_SECONDS)
+        if raw is None:
+            failed_section_titles.append(section["title"])
+            continue
+        try:
+            parsed_section = _extract_json(raw)
+        except (ValueError, json.JSONDecodeError):
+            failed_section_titles.append(section["title"])
+            continue
+        if not parsed_section.get("questions"):
+            failed_section_titles.append(section["title"])
+            continue
+        generated_sections.append(parsed_section)
 
-    sections = parsed.get("sections") or []
-    if not sections:
-        raise ValueError("Model returned no sections.")
+    if not generated_sections:
+        raise ValueError(
+            "The model's response couldn't be turned into any valid questions "
+            "(every section failed or timed out). Try generating again, or with fewer questions."
+        )
 
     # Paper shell first -- if THIS call fails, nothing partial gets left behind.
     created = create_paper(username=username, title=title, subject=subject)
@@ -390,7 +427,7 @@ def generate_question_paper(
     questions_added = 0
     questions_skipped = 0
 
-    for sec_idx, section in enumerate(sections):
+    for sec_idx, section in enumerate(generated_sections):
         sec_title = str(section.get("title") or f"Section {sec_idx + 1}").strip()
         sec_instructions = section.get("instructions")
 
@@ -489,4 +526,5 @@ def generate_question_paper(
         "questions_added": questions_added,
         "questions_skipped": questions_skipped,
         "estimated_total_marks": estimate_total_marks(cleaned_counts),
+        "failed_sections": failed_section_titles,
     }
