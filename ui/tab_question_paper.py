@@ -106,36 +106,21 @@ def _render_generate_form(username: str, active_subject: str, active_chapter: st
         st.markdown("**Choose how many of each question type:**")
         col1, col2, col3 = st.columns(3)
         with col1:
-            n_vsa = st.number_input(
-                "Very Short Answer (1 mark)", min_value=0, max_value=MAX_COUNT_PER_TYPE,
-                value=10, step=1, key="qp_gen_n_vsa",
-            )
-            n_sa = st.number_input(
-                "Short Answer (3 marks)", min_value=0, max_value=MAX_COUNT_PER_TYPE,
-                value=6, step=1, key="qp_gen_n_sa",
-            )
+            n_mcq = st.number_input("MCQ (1 mark)", min_value=0, max_value=MAX_COUNT_PER_TYPE, value=6, step=1, key="qp_gen_n_mcq")
+            n_fill = st.number_input("Fill in the Blanks (1 mark)", min_value=0, max_value=MAX_COUNT_PER_TYPE, value=4, step=1, key="qp_gen_n_fill")
+            n_ar = st.number_input("Assertion-Reason (1 mark)", min_value=0, max_value=MAX_COUNT_PER_TYPE, value=4, step=1, key="qp_gen_n_ar")
         with col2:
-            n_fill = st.number_input(
-                "Fill in the Blanks (3 marks)", min_value=0, max_value=MAX_COUNT_PER_TYPE,
-                value=4, step=1, key="qp_gen_n_fill",
-            )
-            n_ar = st.number_input(
-                "Assertion-Reason (3 marks)", min_value=0, max_value=MAX_COUNT_PER_TYPE,
-                value=4, step=1, key="qp_gen_n_ar",
-            )
+            n_vsa = st.number_input("Very Short Answer (1 mark)", min_value=0, max_value=MAX_COUNT_PER_TYPE, value=6, step=1, key="qp_gen_n_vsa")
+            n_sa = st.number_input("Short Answer (2 marks)", min_value=0, max_value=MAX_COUNT_PER_TYPE, value=6, step=1, key="qp_gen_n_sa")
         with col3:
-            n_la = st.number_input(
-                "Long Answer (5 marks)", min_value=0, max_value=MAX_COUNT_PER_TYPE,
-                value=6, step=1, key="qp_gen_n_la",
-            )
-            n_case = st.number_input(
-                "Case-Based (~9 marks, 3 sub-Qs)", min_value=0, max_value=MAX_COUNT_PER_TYPE,
-                value=4, step=1, key="qp_gen_n_case",
-            )
+            n_la_long = st.number_input("Long Answer (4 marks)", min_value=0, max_value=MAX_COUNT_PER_TYPE, value=4, step=1, key="qp_gen_n_la_long")
+            n_la_vlong = st.number_input("Very Long Answer (5 marks)", min_value=0, max_value=MAX_COUNT_PER_TYPE, value=4, step=1, key="qp_gen_n_la_vlong")
+            n_case = st.number_input("Case-Based (4 marks: 1+1+2)", min_value=0, max_value=MAX_COUNT_PER_TYPE, value=4, step=1, key="qp_gen_n_case")
 
         question_counts = {
-            "vsa": n_vsa, "sa": n_sa, "fill_blank": n_fill,
-            "assertion_reason": n_ar, "la": n_la, "case_based": n_case,
+            "mcq": n_mcq, "fill_blank": n_fill, "assertion_reason": n_ar,
+            "vsa": n_vsa, "sa": n_sa, "la_long": n_la_long, "la_vlong": n_la_vlong,
+            "case_based": n_case,
         }
         total_questions = sum(question_counts.values())
         est_marks = estimate_total_marks(question_counts)
