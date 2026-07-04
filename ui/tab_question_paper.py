@@ -111,6 +111,9 @@ def _render_generate_form(username: str, active_subject: str, active_chapter: st
                         total_marks_target=total_marks_target,
                         lang=target_language,
                     )
+                except ValueError as e:
+                    st.error(f"Couldn't generate this paper: {e}")
+                    return
                 except BridgeRequestError as e:
                     st.error(f"Couldn't generate this paper: {e.detail}")
                     return
@@ -119,6 +122,8 @@ def _render_generate_form(username: str, active_subject: str, active_chapter: st
                     return
 
             st.success(f"Generated \"{result['title']}\"! Pick it from the list below to start.")
+            if result["questions_skipped"]:
+                st.caption(f"({result['questions_added']} questions added, {result['questions_skipped']} skipped for not matching the expected format.)")
             st.rerun()
 
 
