@@ -334,3 +334,14 @@ def get_theme_color(username: str) -> str:
 
 def set_theme_color(username: str, theme_color: str) -> None:
     _post("/users/theme_color", json={"username": username, "theme_color": theme_color})
+
+# ---------------------------------------------------------------------
+# Tutorial-completed flag (persists per-account, same pattern as theme_color)
+# ---------------------------------------------------------------------
+def get_tutorial_completed(username: str) -> bool:
+    result = _get("/users/tutorial_completed", params={"username": username})
+    return bool(result["completed"])
+
+
+def set_tutorial_completed(username: str, completed: bool) -> None:
+    _post("/users/tutorial_completed", json={"username": username, "completed": completed})
