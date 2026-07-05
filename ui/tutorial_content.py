@@ -3,12 +3,31 @@ ui/tutorial_content.py
 =========================
 Pure content for the onboarding tutorial — no Streamlit calls here, just
 data structures. Kept separate from ui/tab_tutorial.py (the renderer) so
-the actual wording/steps can be edited without touching rendering logic,
-and so the content is easy to scan/update as features change.
+the actual wording/steps can be edited without touching rendering logic.
+
+Each step now carries a `target`: a match spec telling the spotlight
+overlay (ui/tutorial_overlay.py) exactly which real element to highlight,
+by its actual visible label/text -- NOT a guessed CSS selector or
+sibling index, since those break silently the moment Streamlit's
+internal markup shifts. Match types:
+  - {"type": "css", "selector": "..."}          -- unique elements (sidebar itself)
+  - {"type": "tab_text", "text": "..."}          -- a tab button, by its exact label
+  - {"type": "widget_label", "label": "...", "container": "..."} --
+        an input/selectbox/uploader, found via its label text, then
+        widened to the given container testid (stTextInput, stSelectbox,
+        stFileUploader, etc.) so the whole widget is highlighted, not
+        just the (possibly visually hidden) label text itself.
+  - {"type": "button_text", "text": "..."}       -- a plain button, by its exact label
+
+IMPORTANT: `target` label/text values must exactly match the real
+widget labels in ui/sidebar.py and the real tab labels in app.py.
+If either changes, update the corresponding target here too.
 """
 
 # Each "pathway" is a guided sequence of steps for a specific goal.
-# Each step: a short title, a description, and which real tab it points to.
+# Each step: a short title, a description, which real tab it lives on
+# (informational only, shown in the picker/reference), and a `target`
+# telling the overlay what to actually highlight.
 PATHWAYS = {
     "upload_and_study": {
         "label": "📚 I want to upload material and start studying",
@@ -21,15 +40,25 @@ PATHWAYS = {
                     "(e.g. \"Biology\") and click **Create**. This is just a folder — you can "
                     "make as many subjects as you like."
                 ),
+                "target": {
+                    "type": "widget_label",
+                    "label": "➕ Create New Subject",
+                    "container": "stTextInput",
+                },
             },
             {
                 "title": "2. Upload Your Material",
                 "tab": "Sidebar",
                 "body": (
-                    "Select your new subject from the dropdown, then upload a **PDF or TXT** "
-                    "file using the uploader that appears. Each file becomes a \"chapter\" you can "
-                    "study independently."
+                    "Select your new subject from the **Select Subject** dropdown, then upload a "
+                    "**PDF or TXT** file using the uploader that appears. Each file becomes a "
+                    "\"chapter\" you can study independently."
                 ),
+                "target": {
+                    "type": "widget_label",
+                    "label": "Upload PDF or TXT",
+                    "container": "stFileUploader",
+                },
             },
             {
                 "title": "3. Select Your Active Chapter",
@@ -39,6 +68,11 @@ PATHWAYS = {
                     "in the app — chat, flashcards, quizzes, study tools — works on whichever "
                     "chapter is active here."
                 ),
+                "target": {
+                    "type": "widget_label",
+                    "label": "Active Chapter",
+                    "container": "stSelectbox",
+                },
             },
             {
                 "title": "4. Ask the Tutor Anything",
@@ -48,15 +82,17 @@ PATHWAYS = {
                     "it answers using your uploaded content. Try slash-commands too: "
                     "`!summary`, `!explain`, `!mcq`, or `!diagram <topic>`."
                 ),
+                "target": {"type": "tab_text", "text": "💬 Tutor"},
             },
             {
                 "title": "5. Generate Study Aids",
-                "tab": "🛠️ Study Tools",
+                "tab": "📚 Study",
                 "body": (
-                    "In **Study Tools**, generate a Study Roadmap, Summary, Cheat Sheet, Formula "
+                    "In **Study**, generate a Study Roadmap, Summary, Cheat Sheet, Formula "
                     "Sheet, Vocabulary Builder, or a visual Concept Map — all built from your "
                     "actual uploaded chapter."
                 ),
+                "target": {"type": "tab_text", "text": "📚 Study"},
             },
         ],
     },
@@ -65,47 +101,52 @@ PATHWAYS = {
         "steps": [
             {
                 "title": "1. Generate a Quiz",
-                "tab": "⚡ Batch Gen",
+                "tab": "📝 Practice & Exams",
                 "body": (
-                    "In **Batch Gen**, choose \"Mixed Interactive Quiz\", set how many questions "
-                    "you want, and click Generate. This creates a real, gradeable quiz from your "
-                    "active chapter."
+                    "In **Practice & Exams**, choose \"Mixed Interactive Quiz\", set how many "
+                    "questions you want, and click Generate. This creates a real, gradeable quiz "
+                    "from your active chapter."
                 ),
+                "target": {"type": "tab_text", "text": "📝 Practice & Exams"},
             },
             {
                 "title": "2. Take the Quiz",
-                "tab": "📝 Assessment",
+                "tab": "📝 Practice & Exams",
                 "body": (
-                    "Go to **Assessment**, load the quiz, and answer each question. You can flip "
-                    "between Multiple Choice and Short Answer questions — short answers are graded "
-                    "by AI with partial credit, not just right/wrong."
+                    "Load the quiz and answer each question. You can flip between Multiple "
+                    "Choice and Short Answer questions — short answers are graded by AI with "
+                    "partial credit, not just right/wrong."
                 ),
+                "target": {"type": "tab_text", "text": "📝 Practice & Exams"},
             },
             {
                 "title": "3. Try Negative Marking (Optional)",
-                "tab": "📝 Assessment",
+                "tab": "📝 Practice & Exams",
                 "body": (
                     "Before loading a quiz, you can toggle **Negative Marking** on if you want "
                     "exam-style scoring, where wrong attempted MCQs deduct partial marks. Skipped "
                     "questions are never penalized."
                 ),
+                "target": {"type": "tab_text", "text": "📝 Practice & Exams"},
             },
             {
                 "title": "4. Review Your Results",
-                "tab": "📝 Assessment",
+                "tab": "📝 Practice & Exams",
                 "body": (
                     "After submitting, you'll see your total score and a question-by-question "
                     "breakdown with feedback — including why a short answer earned partial credit."
                 ),
+                "target": {"type": "tab_text", "text": "📝 Practice & Exams"},
             },
             {
                 "title": "5. Practice with Flashcards",
-                "tab": "🗂️ Flashcards",
+                "tab": "📚 Study",
                 "body": (
                     "Generate a flashcard deck and study it. Mark cards \"Forgot\" or \"Knew It\" — "
                     "forgotten cards land in the dedicated **Practice Forgotten** queue so you can "
                     "drill exactly what's tripping you up."
                 ),
+                "target": {"type": "tab_text", "text": "📚 Study"},
             },
         ],
     },
@@ -114,11 +155,12 @@ PATHWAYS = {
         "steps": [
             {
                 "title": "1. Take a Few Quizzes First",
-                "tab": "📝 Assessment",
+                "tab": "📝 Practice & Exams",
                 "body": (
                     "Progress tracking is built from real quiz attempts — take at least 1-2 "
                     "quizzes before checking this out, or there won't be much to show yet."
                 ),
+                "target": {"type": "tab_text", "text": "📝 Practice & Exams"},
             },
             {
                 "title": "2. Check the AI Dashboard",
@@ -128,6 +170,7 @@ PATHWAYS = {
                     "mastered, what needs work, and what to do next — written by AI, but based "
                     "entirely on your real quiz history, not guesses."
                 ),
+                "target": {"type": "tab_text", "text": "🤖 Dashboard"},
             },
             {
                 "title": "3. Explore the Progress Tab",
@@ -137,6 +180,7 @@ PATHWAYS = {
                     "red = needs work), your weakest topics, study streaks, accuracy trends over "
                     "time, and a Predicted Exam Readiness Score."
                 ),
+                "target": {"type": "tab_text", "text": "📊 Progress"},
             },
             {
                 "title": "4. Let the Tutor Remember Your Weak Spots",
@@ -145,6 +189,7 @@ PATHWAYS = {
                     "Once weak topics are detected, the Tutor chat automatically knows about them "
                     "and will be extra careful explaining those areas — you don't have to remind it."
                 ),
+                "target": {"type": "tab_text", "text": "💬 Tutor"},
             },
         ],
     },
@@ -161,27 +206,19 @@ FEATURE_REFERENCE = [
         "summary": "Chat about your uploaded material. Slash-commands: !summary, !explain, !mcq, !short, !long, !translate, !quizme, !diagram <topic>. Toggle Socratic Mode to be guided with questions instead of given direct answers.",
     },
     {
-        "tab": "🛠️ Study Tools",
-        "summary": "Generate Study Roadmaps, Summaries, Cheat Sheets, Formula Sheets, Vocabulary Builders, visual Concept Maps, Daily Learning Goals, and view your AI Mistake Notebook.",
+        "tab": "📚 Study",
+        "summary": "Generate Study Roadmaps, Summaries, Cheat Sheets, Formula Sheets, Vocabulary Builders, visual Concept Maps, drill Flashcards, and browse/download every generated file for your active chapter.",
     },
     {
-        "tab": "🗂️ Flashcards",
-        "summary": "Generate and study flashcard decks with a Leitner-box system. Practice Forgotten cards separately, generate more cards anytime, or reset progress.",
-    },
-    {
-        "tab": "⚡ Batch Gen",
-        "summary": "Bulk-generate either a digital interactive quiz (for the Assessment tab) or a printable mock exam paper with a question sheet and answer key.",
-    },
-    {
-        "tab": "📝 Assessment",
-        "summary": "Take generated quizzes with real grading: exact-match for MCQs, AI partial-credit grading for short answers, and an optional negative marking toggle.",
+        "tab": "📝 Practice & Exams",
+        "summary": "Bulk-generate and take interactive quizzes with real grading (exact-match MCQs, AI partial-credit short answers, optional negative marking), or build a full printable Question Paper with sections and a timer.",
     },
     {
         "tab": "📊 Progress",
         "summary": "Knowledge Heatmap, Weak Topic Detection, Study Streaks, Learning Analytics (time/accuracy/trends), and a Predicted Exam Readiness Score.",
     },
     {
-        "tab": "📄 Viewer",
-        "summary": "Browse and download every file generated for your active chapter — study guides, quizzes, flashcards, mock exams — and export text files to PDF.",
+        "tab": "⚙️ Settings",
+        "summary": "Account info, accent color picker, and a button to replay this tutorial anytime.",
     },
 ]
