@@ -2,15 +2,41 @@
 core/llm.py
 ===========
 Lazy-loaded LLM access and the shared internet/image search tools.
-Centralizing this means model names/params are changed in one place,
-and a downed Ollama instance fails gracefully instead of crashing imports.
+
+CHANGE LOG (this revision) -- WHY THIS FILE CHANGED:
+  Previously, get_llm() returned a langchain_ollama.ChatOllama instance
+  built with `base_url=OLLAMA_BASE_URL`, which talks DIRECTLY to Ollama's
+  native HTTP API. That request has no concept of "username" and never
+  passes through storage_bridge.py's /ollama/chat or /ollama/generate
+  routes -- which is where _require_active_subscription() and
+  _require_tier() actually live. The result: every AI feature (chat,
+  quiz generation, question papers) completely bypassed subscription
+  and tier enforcement. Toggling a student's tier or active status in
+  the admin GUI had zero effect on whether they could use AI features,
+  because the enforcement code was never in the request path.
+
+  This revision replaces ChatOllama with BridgeChatLLM, a minimal shim
+  that exposes the SAME .invoke(prompt) -> response.content interface
+  your features/*.py code already expects, but internally calls
+  bridge_client.ollama_chat(), which DOES enforce tier/subscription on
+  the bridge side before proxying to Ollama.
+
+  THE ONE UNAVOIDABLE CHANGE AT CALL SITES: because the bridge's gate
+  is keyed on username, every call to get_llm() and invoke_with_timeout()
+  now needs a `username` passed in. Search your codebase for:
+      get_llm(          -> now get_llm(model_type=..., username=...)
+      invoke_with_timeout(  -> now needs username= too
+  and update each call site accordingly. Without a username, the shim
+  cannot ask the bridge whether this request is even allowed.
 """
 import threading
 from typing import Optional
-from langchain_ollama import ChatOllama
 from langchain_community.tools import DuckDuckGoSearchRun
 from ddgs import DDGS
-from config import OLLAMA_MAIN_MODEL, OLLAMA_BASE_URL
+
+import bridge_client
+from bridge_client import BridgeRequestError, BridgeUnavailableError
+from config import OLLAMA_MAIN_MODEL
 
 # Single shared search tool instance.
 internet_search = DuckDuckGoSearchRun()
@@ -41,25 +67,78 @@ def search_images(query: str, max_results: int = 4) -> list:
         return []
 
 
-def invoke_with_timeout(llm: ChatOllama, prompt: str, timeout_seconds: int = 60) -> Optional[str]:
+class _LLMResponse:
+    """Minimal stand-in for langchain's AIMessage, so callers that do
+    `response = llm.invoke(prompt); text = response.content` keep working
+    unchanged."""
+    __slots__ = ("content",)
+
+    def __init__(self, content: str):
+        self.content = content
+
+
+class BridgeChatLLM:
     """
-    Call ChatOllama.invoke() with a timeout.
+    Drop-in replacement for ChatOllama's .invoke(prompt) -> response.content
+    interface, EXCEPT calls now go through storage_bridge.py's /ollama/chat
+    route (via bridge_client.ollama_chat()) instead of straight to Ollama.
+    This is what makes _require_active_subscription() and _require_tier()
+    actually run before any inference happens.
 
-    IMPORTANT: the real timeout enforcement lives in the httpx client itself
-    (see client_kwargs={"timeout": ...} in get_llm() below). httpx's timeout
-    actually aborts the underlying TCP connection to Ollama when exceeded,
-    which frees up Ollama's inference slot immediately.
+    Raises BridgeRequestError if the bridge rejects the request (inactive
+    subscription -> 402, tier too low -> 403, daily cap hit -> 429) --
+    callers should catch this and show req.detail to the user, same as
+    they already do for other bridge_client calls elsewhere in the app.
+    Raises BridgeUnavailableError if the bridge itself can't be reached.
+    """
 
-    This thread wrapper is a secondary safety net only — it guards against
-    edge cases where the httpx timeout doesn't cleanly surface as an
-    exception (e.g. certain ngrok-layer hangs). It is NOT the primary
-    cancellation mechanism. A bare thread.join(timeout=...) on its own
-    cannot kill a running thread; without the httpx-level timeout, the
-    abandoned call would keep running on the server and occupy Ollama's
-    single inference slot indefinitely, causing every subsequent call to
-    queue up and get progressively slower.
+    def __init__(self, model: str, username: str, system: Optional[str] = None,
+                 num_predict: Optional[int] = None):
+        self.model = model
+        self.username = username
+        self.system = system
+        # num_predict is accepted for API-compatibility with the old
+        # get_llm() call sites (quiz/paper generation passed this to
+        # ChatOllama to bound response length) but isn't currently
+        # forwarded -- storage_bridge.py's /ollama/chat route doesn't
+        # accept options/num_predict yet. If you need this enforced,
+        # add an `options` field to OllamaChatRequest in storage_bridge.py
+        # and thread it through bridge_client.ollama_chat().
+        self.num_predict = num_predict
 
-    Returns the response content, or None on timeout/error.
+    def invoke(self, prompt: str) -> _LLMResponse:
+        messages = []
+        if self.system:
+            messages.append({"role": "system", "content": self.system})
+        messages.append({"role": "user", "content": prompt})
+
+        result = bridge_client.ollama_chat(
+            username=self.username,
+            model=self.model,
+            messages=messages,
+        )
+        # storage_bridge.py's /ollama/chat proxies Ollama's own response
+        # shape verbatim: {"message": {"role": "assistant", "content": "..."}, ...}
+        content = result.get("message", {}).get("content", "")
+        return _LLMResponse(content)
+
+
+def invoke_with_timeout(llm: "BridgeChatLLM", prompt: str, timeout_seconds: int = 60) -> Optional[str]:
+    """
+    Call BridgeChatLLM.invoke() with a timeout.
+
+    NOTE: the timeout here is a client-side thread-join safety net only
+    (same caveat as before: a bare thread.join() can't forcibly kill a
+    stuck thread, it just stops waiting for it). The bridge's own HTTP
+    call to Ollama has its own timeout (LLM_REQUEST_TIMEOUT in
+    bridge_client.py, currently 300s) which is the one that actually
+    aborts the upstream connection.
+
+    Returns the response content, or None on timeout/error. On a
+    BridgeRequestError (tier too low, inactive subscription, daily cap
+    hit), re-raises it rather than swallowing it as None -- the caller
+    needs to distinguish "Ollama is slow" from "this user isn't allowed
+    to do this" so it can show the right message.
     """
     result = {"content": None, "error": None}
 
@@ -67,17 +146,17 @@ def invoke_with_timeout(llm: ChatOllama, prompt: str, timeout_seconds: int = 60)
         try:
             response = llm.invoke(prompt)
             result["content"] = response.content
+        except (BridgeRequestError, BridgeUnavailableError):
+            raise
         except Exception as e:
             result["error"] = e
 
     thread = threading.Thread(target=invoke_thread, daemon=True)
     thread.start()
-    # Small buffer over the httpx timeout, since httpx should fire first
-    # and unwind invoke_thread() cleanly before this join() would expire.
     thread.join(timeout=timeout_seconds + 5)
 
     if thread.is_alive():
-        print(f"[ScholarAI] LLM timeout after {timeout_seconds}s — Ollama may be stuck or overloaded")
+        print(f"[ScholarAI] LLM timeout after {timeout_seconds}s — bridge/Ollama may be stuck or overloaded")
         return None
 
     if result["error"]:
@@ -87,48 +166,47 @@ def invoke_with_timeout(llm: ChatOllama, prompt: str, timeout_seconds: int = 60)
     return result["content"]
 
 
-def get_llm(model_type: str = "main", request_timeout: float = 60.0):
+def get_llm(model_type: str = "main", username: str = None, request_timeout: float = 60.0):
     """
-    Get a ChatOllama instance configured for the specified task.
+    Get a BridgeChatLLM instance configured for the specified task.
+    ALL inference now goes through storage_bridge.py's /ollama/chat route,
+    which enforces subscription + tier before proxying to Ollama.
 
     Args:
         model_type: "main" for standard inference, "quiz" for quiz generation,
             "paper" for question-paper generation (one question type per call).
-        request_timeout: seconds before the underlying httpx client aborts
-            the request. This is the REAL timeout — it actually cancels the
-            TCP connection to Ollama, unlike a bare Python thread timeout.
+        username: REQUIRED. The bridge's tier/subscription gate is keyed on
+            this. Every existing call site that previously did
+            `get_llm("quiz")` etc. now needs `get_llm("quiz", username=username)`.
+        request_timeout: currently unused directly here (the bridge enforces
+            its own upstream timeout) -- kept as a parameter for call-site
+            compatibility; pass through to invoke_with_timeout()'s
+            timeout_seconds instead.
 
     Returns:
-        ChatOllama instance or None if connection fails.
+        BridgeChatLLM instance, or None if username is missing (fails
+        loudly via a printed error rather than silently making an
+        unauthenticated call).
     """
+    if not username:
+        print("[ScholarAI] get_llm() called without a username -- cannot route through the "
+              "bridge's tier/subscription check. Every call site must now pass username=.")
+        return None
+
     try:
-        common_kwargs = dict(
-            model=OLLAMA_MAIN_MODEL,
-            base_url=OLLAMA_BASE_URL,
-            temperature=0.1,
-            top_p=0.2,
-            client_kwargs={
-                "headers": {"ngrok-skip-browser-warning": "true"},
-                "timeout": request_timeout,
-            },
-        )
+        num_predict = None
         if model_type == "quiz":
-            # num_predict sized for a SINGLE CHUNK's worth of questions
-            # (chunked quiz generation sends many small requests rather than
-            # one giant one — see features/chat_graph.py). 1024 tokens is
-            # comfortably enough for a handful of questions per chunk while
-            # keeping worst-case generation time low.
-            return ChatOllama(**common_kwargs, num_ctx=8192, num_predict=1024)
-        if model_type == "paper":
-            # Question papers now generate ONE QUESTION TYPE AT A TIME
-            # (see features/question_paper_generator.py) -- e.g. a
-            # separate call for "6 mcq", another for "4 fill_blank", etc.
-            # rather than a whole section or the whole paper at once.
-            # 3072 tokens comfortably covers up to MAX_COUNT_PER_TYPE (25)
-            # questions of a single type, including mcq's 4-option lists,
-            # while keeping each individual call's worst-case time bounded.
-            return ChatOllama(**common_kwargs, num_ctx=8192, num_predict=3072)
-        return ChatOllama(**common_kwargs, num_ctx=8192)
+            # Sized for a SINGLE CHUNK's worth of questions (chunked quiz
+            # generation sends many small requests rather than one giant
+            # one -- see features/chat_graph.py).
+            num_predict = 1024
+        elif model_type == "paper":
+            # Question papers generate ONE QUESTION TYPE AT A TIME (see
+            # features/question_paper_generator.py) -- 3072 tokens covers
+            # up to MAX_COUNT_PER_TYPE (25) questions of a single type.
+            num_predict = 3072
+
+        return BridgeChatLLM(model=OLLAMA_MAIN_MODEL, username=username, num_predict=num_predict)
     except Exception as e:
-        print(f"[ScholarAI] Error connecting to Ollama: {e}")
+        print(f"[ScholarAI] Error setting up bridge-routed LLM: {e}")
         return None
