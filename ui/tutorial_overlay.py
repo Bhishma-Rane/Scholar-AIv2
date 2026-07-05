@@ -3,24 +3,42 @@ ui/tutorial_overlay.py
 =========================
 A spotlight-style guided tour overlay: dims the whole screen except a
 highlighted cutout around the step's target element, with a tooltip box
-showing the instruction + Next/Back/Skip controls. Replaces the old
-plain step-card tutorial (ui/tab_tutorial.py's _render_pathway_walkthrough)
-with something that actually points at real UI elements instead of just
-describing them in text.
+showing the instruction. Draws over the real, already-rendered app (see
+ui/tab_tutorial.py + app.py for how that's guaranteed).
 
 HOW TARGETING WORKS:
-Each step specifies a CSS `selector` for a *type* of element (e.g. all
-tab buttons) plus a numeric `index` into the matches for that selector,
-in document order. We deliberately do NOT use :nth-of-type in the CSS
-selector itself -- :nth-of-type counts sibling position among ALL
-elements of that tag name *before* any attribute filter is applied, so
-e.g. `button[data-baseweb='tab']:nth-of-type(2)` does not mean "the 2nd
-tab button" -- it means "the 2nd <button> sibling overall, if it also
-happens to match the attribute filter." That breaks silently the moment
-any other <button> (e.g. a tab-strip scroll arrow on a narrow/mobile
-viewport) appears earlier in the same container. Instead we query all
-real matches for the base selector via querySelectorAll and index into
-that already-filtered list in JS.
+Each step (defined in ui/tutorial_content.py, inside PATHWAYS) carries a
+`target` dict describing HOW to find the real element, by its actual
+visible label/text rather than a guessed CSS selector or sibling index
+(both of which break silently the moment Streamlit's internal markup
+shifts, or another element appears earlier in the DOM). Supported types:
+
+  - {"type": "css", "selector": "..."}
+        A single, genuinely unique element. querySelector directly.
+        Used for things like the sidebar container itself.
+
+  - {"type": "tab_text", "text": "💬 Tutor"}
+        A tab button, matched by its exact visible label among all
+        `button[data-baseweb='tab']` elements. Self-correcting if tabs
+        get reordered; breaks (safely, falling back to a centered
+        tooltip) if a label's wording changes -- update tutorial_content.py
+        if you rename a tab.
+
+  - {"type": "widget_label", "label": "Active Chapter", "container": "stSelectbox"}
+        An input/selectbox/uploader, found by its label text among
+        `[data-testid='stWidgetLabel']` elements, then widened to the
+        nearest ancestor matching the given container testid (e.g.
+        stTextInput, stSelectbox, stFileUploader, stNumberInput) so the
+        whole widget is highlighted -- not just the label text, which
+        may be visually hidden (label_visibility="collapsed") even
+        though it's still present in the DOM and matchable by text.
+
+  - {"type": "button_text", "text": "Create"}
+        A plain button, matched by its exact visible text.
+
+If a target can't be resolved (label wording drifted, element not yet
+rendered, etc.) we fall back to a plain centered tooltip with no
+dimming, rather than crashing -- console.warn logs the reason.
 
 LIMITATION: this overlay lives in an iframe (st.iframe always sandboxes
 its content), so it cannot directly see elements in the parent
@@ -28,68 +46,33 @@ Streamlit page through normal means -- but Streamlit's component
 iframes ARE same-origin with the parent page, so `window.parent.document`
 is reachable. That's what makes targeting real elements possible at all.
 
-IMPORTANT: the CSS for #tutorial-spotlight / #tutorial-tooltip must be
-injected into the PARENT document, not just left in this iframe's own
-<style> block. The spotlight/tooltip <div>s themselves are created via
-`parentDoc.createElement(...)` and appended to `parentDoc.body`, so they
-live in the parent page's DOM -- a stylesheet that only exists inside
-this iframe's own srcdoc never applies to them. We inject the stylesheet
-into `parentDoc.head` once (guarded by an id check) and reuse it on
-every step/rerun.
+IMPORTANT: the CSS for #tutorial-spotlight / #tutorial-tooltip is
+injected into the PARENT document (once, guarded by an id check) rather
+than left in this iframe's own <style> block -- the spotlight/tooltip
+divs are created via `parentDoc.createElement(...)` and appended to
+`parentDoc.body`, so they live in the parent page's DOM, and a
+stylesheet scoped to this iframe's own srcdoc never applies to them.
 
 NAVIGATION: the actual Next/Back/Skip controls are plain Streamlit
 buttons rendered OUTSIDE this component (in tab_tutorial.py, right below
 the call to render_tutorial_overlay()) -- an iframe can't host clickable
 Streamlit widgets itself, so this component is visual-only and the real
-interaction happens via normal st.button calls alongside it.
+interaction happens via normal st.button calls alongside it. The
+spotlight/dim overlay itself uses `pointer-events: none`, so clicks
+still pass straight through to the real element underneath -- useful if
+you want to let people click the actual target instead of just Next.
 
 USAGE (see ui/tab_tutorial.py for the full integration):
-    render_tutorial_overlay(TUTORIAL_STEPS, step_index)
+    render_tutorial_overlay(steps, step_index)
     # ...then separately, plain st.button("Next"), st.button("Back"), etc.
 """
+import json
+
 import streamlit as st
 
-# Each step: a `selector` matching a *category* of real elements in the
-# parent document, an `index` picking which match (0-based, in document
-# order), a title, and body text. `selector` should be as stable as
-# possible -- data-testid attributes survive Streamlit version bumps
-# better than auto-generated class names.
-TUTORIAL_STEPS = [
-    {
-        "selector": "[data-testid='stSidebar']",
-        "index": 0,
-        "title": "Your Workspace",
-        "body": "This is your sidebar — create subjects, upload chapters, and switch between them here.",
-    },
-    {
-        "selector": "button[data-baseweb='tab']",
-        "index": 0,
-        "title": "Dashboard",
-        "body": "Your AI coach reads your real quiz history here and tells you what to focus on next.",
-    },
-    {
-        "selector": "button[data-baseweb='tab']",
-        "index": 1,
-        "title": "Tutor",
-        "body": "Chat with an AI tutor about your uploaded chapter — ask questions, get explanations.",
-    },
-    {
-        "selector": "button[data-baseweb='tab']",
-        "index": 2,
-        "title": "Study",
-        "body": "Generate study aids, drill flashcards, and review your chapter's source PDF, all in one place.",
-    },
-    {
-        "selector": "button[data-baseweb='tab']",
-        "index": 3,
-        "title": "Practice & Exams",
-        "body": "Generate and take quizzes, or build a full Question Paper with sections and a timer.",
-    },
-]
-
 # CSS for the spotlight cutout + tooltip. Injected into the PARENT
-# document once (see render_tutorial_overlay), not into this iframe's
-# own document -- the elements it styles live in the parent's DOM.
+# document once -- the elements it styles live in the parent's DOM, not
+# in this iframe's own document.
 _OVERLAY_CSS = """
 #tutorial-spotlight {
     position: fixed;
@@ -132,13 +115,15 @@ def render_tutorial_overlay(steps: list, step_index: int):
     """
     Renders the spotlight overlay for the given step. Visual only --
     pair this with real st.button calls right after for Next/Back/Skip.
+
+    `steps` is a pathway's step list from ui/tutorial_content.py's
+    PATHWAYS -- each step must have "title", "body", and "target" keys.
     """
     if step_index < 0 or step_index >= len(steps):
         return
 
     step = steps[step_index]
-    selector_js = step["selector"].replace("\\", "\\\\").replace("'", "\\'")
-    nth_js = int(step.get("index", 0))
+    match_json = json.dumps(step["target"])
     title_js = step["title"].replace("\\", "\\\\").replace("'", "\\'")
     body_js = step["body"].replace("\\", "\\\\").replace("'", "\\'")
     css_js = _OVERLAY_CSS.replace("\\", "\\\\").replace("`", "\\`")
@@ -147,6 +132,8 @@ def render_tutorial_overlay(steps: list, step_index: int):
     <div id="tutorial-root"></div>
     <script>
     (function() {{
+        const match = {match_json};
+
         function ensureStylesInjected(parentDoc) {{
             if (!parentDoc.getElementById('tutorial-overlay-styles')) {{
                 const styleEl = parentDoc.createElement('style');
@@ -156,13 +143,52 @@ def render_tutorial_overlay(steps: list, step_index: int):
             }}
         }}
 
+        function resolveTarget(parentDoc, m) {{
+            try {{
+                if (m.type === 'css') {{
+                    return parentDoc.querySelector(m.selector) || null;
+                }}
+                if (m.type === 'tab_text') {{
+                    const tabs = parentDoc.querySelectorAll("button[data-baseweb='tab']");
+                    for (const t of tabs) {{
+                        if (t.textContent.trim() === m.text) return t;
+                    }}
+                    return null;
+                }}
+                if (m.type === 'button_text') {{
+                    const buttons = parentDoc.querySelectorAll('button');
+                    for (const b of buttons) {{
+                        if (b.textContent.trim() === m.text) return b;
+                    }}
+                    return null;
+                }}
+                if (m.type === 'widget_label') {{
+                    const labels = parentDoc.querySelectorAll("[data-testid='stWidgetLabel']");
+                    for (const l of labels) {{
+                        if (l.textContent.trim() === m.label) {{
+                            if (m.container) {{
+                                const container = l.closest("[data-testid='" + m.container + "']");
+                                if (container) return container;
+                            }}
+                            return l.parentElement || l;
+                        }}
+                    }}
+                    return null;
+                }}
+            }} catch (e) {{
+                console.warn('Tutorial overlay target resolution failed:', e);
+            }}
+            return null;
+        }}
+
         function renderTooltipOnly(parentDoc) {{
             const tooltip = parentDoc.createElement('div');
             tooltip.id = 'tutorial-tooltip';
             tooltip.style.top = '40%';
             tooltip.style.left = '50%';
             tooltip.style.transform = 'translate(-50%, -50%)';
-            tooltip.innerHTML = `<h4>{title_js}</h4><p>{body_js}</p>`;
+            tooltip.innerHTML = `<h4>{title_js}</h4><p>{body_js}</p>
+                <div id="tutorial-step-count">Step {step_index + 1} of {len(steps)} (target not found)</div>`;
             parentDoc.body.appendChild(tooltip);
         }}
 
@@ -176,10 +202,10 @@ def render_tutorial_overlay(steps: list, step_index: int):
                 if (existing) existing.remove();
             }});
 
-            const matches = parentDoc.querySelectorAll('{selector_js}');
-            const target = matches[{nth_js}] || null;
+            const target = resolveTarget(parentDoc, match);
 
             if (!target) {{
+                console.warn('Tutorial overlay: no element matched', match);
                 renderTooltipOnly(parentDoc);
                 return;
             }}
