@@ -62,7 +62,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from core.llm import get_llm, invoke_with_timeout
 from core.vectorstore import get_chapter_text
-from bridge_client import create_paper, add_paper_section, add_paper_question, BridgeRequestError, BridgeUnavailableError
+from core.bridge_client import create_paper, add_paper_section, add_paper_question, BridgeRequestError, BridgeUnavailableError
 
 # The five types the in-app answer screen (ui/tab_question_paper.py) can
 # actually render an input for. case_based is a container whose
