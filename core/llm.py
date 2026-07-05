@@ -45,8 +45,8 @@ from typing import Optional, Union
 from langchain_community.tools import DuckDuckGoSearchRun
 from ddgs import DDGS
 
-import bridge_client
-from bridge_client import BridgeRequestError, BridgeUnavailableError
+from core import bridge_client
+from core.bridge_client import BridgeRequestError, BridgeUnavailableError
 from config import OLLAMA_MAIN_MODEL
 
 # Single shared search tool instance.
