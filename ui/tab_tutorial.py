@@ -1,20 +1,34 @@
 """
 ui/tab_tutorial.py
 =====================
-The guided tour content, now rendered as a spotlight overlay (dims the
-real app, highlights the relevant tab/element) instead of a plain text
-card -- since most people were skipping the old text-only version.
+The guided tour content, rendered as a spotlight overlay (dims the real
+app, highlights the relevant tab/element) instead of a plain text card.
 
-This is no longer a top-level tab (see ui/tab_settings.py, which has the
-"Replay Tutorial" button that triggers this). render_tutorial_tab() is
-still used for the automatic first-run gate in app.py (a new account
-sees the pathway picker full-screen before anything else), but the
-step-by-step walkthrough itself now uses the spotlight overlay.
+ARCHITECTURE NOTE (important): the first-run welcome + pathway picker
+is now a real Streamlit modal (st.dialog), shown ON TOP OF the already
+-rendered main app -- NOT a full-screen placeholder that replaces the
+app. Previously, app.py rendered this tab's content instead of the real
+sidebar/tabs and called st.stop(), which meant the spotlight walkthrough
+that follows had nothing real in the DOM to target (every step silently
+fell back to a plain floating box with no dimming, since the sidebar
+and tab buttons it was looking for didn't exist yet). Now the real app
+is always rendered first; the dialog floats over it (Streamlit dims the
+background for a dialog automatically), and once a pathway is picked we
+hand off to the SAME spotlight-overlay code path used by the "Replay
+Tutorial" button in Settings -- so it spotlights real, live, clickable
+elements from the very first step.
+
+render_first_run_gate() is called from app.py AFTER the real app
+(sidebar + tabs) has rendered. render_tutorial_overlay_if_active() is
+also called from app.py (also after the real app renders) and handles
+both the first-run walkthrough (once a pathway's been picked) and the
+"Replay Tutorial" walkthrough from Settings -- they're the same code
+path.
 """
 import streamlit as st
 
 from config import APP_NAME, APP_TAGLINE
-from core.onboarding_store import mark_tutorial_complete
+from core.onboarding_store import has_completed_tutorial, mark_tutorial_complete
 from ui.tutorial_content import PATHWAYS, FEATURE_REFERENCE
 from ui.tutorial_overlay import render_tutorial_overlay, cleanup_tutorial_overlay, TUTORIAL_STEPS
 
@@ -56,15 +70,58 @@ def _render_pathway_picker():
             if st.button(pathway["label"], use_container_width=True, key=f"pathway_btn_{key}"):
                 st.session_state.tutorial_selected_pathway = key
                 st.session_state.tutorial_step_index = 0
+                # Hand off to the spotlight walkthrough, which needs the
+                # dialog closed and the real app visible underneath it.
+                st.session_state["show_tutorial_overlay"] = True
                 st.rerun()
+
+
+def _render_feature_reference():
+    with st.expander("📋 Or just show me everything (full feature list)"):
+        for item in FEATURE_REFERENCE:
+            st.markdown(f"**{item['tab']}** — {item['summary']}")
+
+
+@st.dialog("Welcome", width="large")
+def _first_run_dialog(username: str):
+    """
+    The welcome + pathway-picker step, as a real modal floating over
+    the already-rendered app. Streamlit dims the real background behind
+    a dialog automatically, so -- unlike the old full-screen placeholder
+    -- the sidebar and tabs are genuinely there, rendered and live,
+    right behind this dialog.
+    """
+    _render_welcome()
+    st.markdown("---")
+    _render_pathway_picker()
+    st.markdown("---")
+    _render_feature_reference()
+    st.markdown("---")
+    if st.button("⏭️ Skip Tutorial", use_container_width=True):
+        mark_tutorial_complete(username)
+        st.session_state["show_tutorial_overlay"] = False
+        st.rerun()
+
+
+def render_first_run_gate(username: str):
+    """
+    Call from app.py AFTER the real app (sidebar + tabs) has rendered.
+    Shows the welcome/pathway-picker dialog for users who haven't
+    completed the tutorial yet and haven't already picked a pathway.
+    """
+    if has_completed_tutorial(username):
+        return
+    if st.session_state.get("show_tutorial_overlay"):
+        return  # pathway already picked; the spotlight walkthrough is running
+    _init_tutorial_state()
+    _first_run_dialog(username)
 
 
 def _render_spotlight_walkthrough():
     """
-    Replaces the old plain step-card with the dimmed spotlight overlay
-    (ui/tutorial_overlay.py) -- the visual highlight is rendered by that
-    component, while the Next/Back/Skip controls below are plain
-    Streamlit buttons (an iframe sandbox can't host clickable Streamlit
+    Renders the dimmed spotlight overlay (ui/tutorial_overlay.py) over
+    the real, already-rendered app, plus the Next/Back/Skip controls
+    (plain Streamlit buttons -- an iframe can't host clickable Streamlit
     widgets itself, so the real interaction lives here, outside it).
     """
     steps = TUTORIAL_STEPS
@@ -96,47 +153,13 @@ def _render_spotlight_walkthrough():
     return None
 
 
-def _render_feature_reference():
-    with st.expander("📋 Or just show me everything (full feature list)"):
-        for item in FEATURE_REFERENCE:
-            st.markdown(f"**{item['tab']}** — {item['summary']}")
-
-
-def render_tutorial_tab(username: str) -> bool:
-    """
-    Renders the first-run tutorial gate (full-screen, before the main
-    app). Returns True once the user has finished/skipped (caller
-    should st.rerun() to drop into the main app), False otherwise.
-    """
-    _init_tutorial_state()
-
-    _render_welcome()
-    st.markdown("---")
-
-    if st.session_state.tutorial_selected_pathway is None:
-        _render_pathway_picker()
-        st.markdown("---")
-        _render_feature_reference()
-        st.markdown("---")
-        if st.button("⏭️ Skip Tutorial", use_container_width=True):
-            mark_tutorial_complete(username)
-            return True
-        return False
-    else:
-        result = _render_spotlight_walkthrough()
-        if result == "finish":
-            mark_tutorial_complete(username)
-            return True
-        return False
-
-
 def render_tutorial_overlay_if_active(username: str):
     """
-    Called from app.py on EVERY render (after the main tab UI exists),
-    so the "Replay Tutorial" button in Settings can trigger the
-    spotlight walkthrough over the real app -- as opposed to
-    render_tutorial_tab(), which is only for the very first, full-screen,
-    pre-sidebar gate.
+    Called from app.py on EVERY render, after the real main app UI
+    exists. Handles BOTH the first-run walkthrough (once a pathway has
+    been picked in the dialog) and the "Replay Tutorial" walkthrough
+    triggered from Settings -- same code path either way, since both
+    just need the spotlight drawn over the real, live app.
     """
     if not st.session_state.get("show_tutorial_overlay"):
         return
@@ -144,6 +167,7 @@ def render_tutorial_overlay_if_active(username: str):
     _init_tutorial_state()
     result = _render_spotlight_walkthrough()
     if result == "finish":
+        mark_tutorial_complete(username)
         st.session_state["show_tutorial_overlay"] = False
         st.session_state.tutorial_selected_pathway = None
         st.session_state.tutorial_step_index = 0
