@@ -43,6 +43,11 @@ from core import bridge_client
 from core.bridge_client import BridgeUnavailableError
 
 
+def _clear_local_cache(chroma_db_dir: str):
+    shutil.rmtree(chroma_db_dir, ignore_errors=True)
+    SharedSystemClient.clear_system_cache()
+
+
 def _fetch_subject_files_to_temp_dir(username: str, subject: str) -> "tuple[str, list]":
     """
     Downloads every source file for a subject from the bridge into a
@@ -90,15 +95,15 @@ def get_vector_store(username: str, subject: str, force_rebuild: bool = False):
         client_kwargs={"headers": {"ngrok-skip-browser-warning": "true"}},
     )
 
-    if force_rebuild and os.path.exists(chroma_db_dir):
-        shutil.rmtree(chroma_db_dir)
-        # Force chromadb to drop its cached System client for this path,
-        # otherwise the next Chroma(...) call below reuses a stale client
-        # still pointing at the sqlite file we just deleted.
-        SharedSystemClient.clear_system_cache()
+    if force_rebuild:
+        _clear_local_cache(chroma_db_dir)
 
     if not force_rebuild and os.path.exists(chroma_db_dir) and os.listdir(chroma_db_dir):
-        return Chroma(persist_directory=chroma_db_dir, embedding_function=embeddings)
+        try:
+            return Chroma(persist_directory=chroma_db_dir, embedding_function=embeddings)
+        except Exception as e:
+            print(f"[ScholarAI] Local Chroma cache unusable ({e}); rebuilding...")
+            _clear_local_cache(chroma_db_dir)
 
     temp_dir, local_file_paths = _fetch_subject_files_to_temp_dir(username, subject)
     try:
@@ -130,9 +135,13 @@ def get_vector_store(username: str, subject: str, force_rebuild: bool = False):
             )
 
         if chunks:
-            return Chroma.from_texts(
-                texts=chunks, embedding=embeddings, metadatas=metadatas, persist_directory=chroma_db_dir
-            )
+            try:
+                return Chroma.from_texts(
+                    texts=chunks, embedding=embeddings, metadatas=metadatas, persist_directory=chroma_db_dir
+                )
+            except Exception:
+                _clear_local_cache(chroma_db_dir)
+                raise
         return None
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
