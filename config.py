@@ -24,6 +24,17 @@ MATERIAL_TYPES = ["Study Roadmap", "One-Page Summary", "Exam Cheat Sheet", "Key 
 
 OLLAMA_MAIN_MODEL = "llama3"
 OLLAMA_EMBED_MODEL = "nomic-embed-text"
+
+# LEGACY / NO LONGER READ BY core/llm.py -- kept only in case something
+# else in the codebase still imports it (grep for OLLAMA_BASE_URL before
+# deleting outright). This used to be the base_url ChatOllama connected
+# to directly, which was the root cause of the tier/subscription bypass:
+# it let the app reach Ollama through path_proxy.py's old "/ollama" route
+# without ever touching storage_bridge.py's tier/subscription checks.
+# core/llm.py's BridgeChatLLM now routes every LLM call through
+# BRIDGE_BASE_URL + "/ollama/chat" instead (via bridge_client.ollama_chat()),
+# so this value has no effect on LLM calls anymore. Safe to delete once
+# you've confirmed no other module reads it directly.
 OLLAMA_BASE_URL = st.secrets.get("OLLAMA_BASE_URL", os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"))
 
 BRIDGE_BASE_URL = st.secrets.get("BRIDGE_BASE_URL", os.environ.get("BRIDGE_BASE_URL", "")).rstrip("/")
