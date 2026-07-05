@@ -7,8 +7,22 @@ an HTTP call to storage_bridge.py running on Bhishma's Windows laptop
 
 This is the ONLY module that should know about the bridge's URL/secret
 or its HTTP details. Everything else (core/credentials.py, ui/sidebar.py,
-ui/auth.py) should call these functions and not touch `requests` directly,
-so the bridge's transport details stay swappable in one place.
+ui/auth.py, core/llm.py) should call these functions and not touch
+`requests` directly, so the bridge's transport details stay swappable
+in one place.
+
+CHANGE LOG (this revision):
+  - Added ollama_chat() / ollama_generate() -- these were previously
+    MISSING, which meant core/llm.py was building a ChatOllama client
+    pointed straight at OLLAMA_BASE_URL (raw Ollama), completely
+    bypassing storage_bridge.py's /ollama/chat and /ollama/generate
+    routes -- and therefore bypassing _require_active_subscription()
+    and _require_tier() entirely. This is why tier/subscription changes
+    made in the admin GUI had zero effect on actual AI usage: the
+    enforcement code was never in the request path.
+  - Added start_quiz_attempt() / submit_quiz_attempt() / get_usage_today()
+    for the same reason -- storage_bridge.py already defined these
+    routes, but nothing in this client called them.
 
 All functions fail SAFE-but-LOUD: if the bridge is unreachable (laptop
 off, tunnel down, wrong URL), they raise BridgeUnavailableError rather
@@ -20,17 +34,18 @@ account creation seem to fail when it's really a connectivity problem.
 BridgeRequestError (added alongside the password-reset feature) is the
 other failure mode: the bridge WAS reached and responded, but rejected
 this specific request as invalid (expired/used/bad token, password too
-short, etc.). Carries the bridge's own .detail message, which is safe to
-show directly in the UI. This is distinct from BridgeUnavailableError on
-purpose — one means "try again later, something's down", the other means
-"this specific thing you typed was wrong, here's why."
+short, tier too low, daily cap hit, etc.). Carries the bridge's own
+.detail message, which is safe to show directly in the UI. This is
+distinct from BridgeUnavailableError on purpose — one means "try again
+later, something's down", the other means "this specific thing you
+typed/did was wrong, here's why."
 """
 import requests
-print("bridge_client.py LOADED")
 
 from config import BRIDGE_BASE_URL, BRIDGE_SHARED_SECRET
 
 REQUEST_TIMEOUT = 15  # seconds — bridge calls are small JSON/file ops, should be fast
+LLM_REQUEST_TIMEOUT = 300  # seconds — chat/generate calls proxy through to Ollama and can run long
 
 
 class BridgeUnavailableError(Exception):
@@ -43,8 +58,10 @@ class BridgeRequestError(Exception):
     """
     Raised when the bridge is reachable and responded, but rejected the
     request as invalid (4xx other than a bad shared secret) -- e.g. an
-    expired or already-used password reset token. Carries the bridge's
-    own detail message, which is safe to show directly to the user.
+    expired or already-used password reset token, an inactive
+    subscription (402), a tier that's too low (403), or a daily usage
+    cap that's been hit (429). Carries the bridge's own detail message,
+    which is safe to show directly to the user.
     """
     def __init__(self, detail: str, status_code: int):
         self.detail = detail
@@ -65,15 +82,8 @@ def _post(path: str, **kwargs) -> dict:
             timeout=timeout,
             **kwargs,
         )
-
-        print("POST:", f"{BRIDGE_BASE_URL}{path}")
-        print("STATUS:", resp.status_code)
-        print("TEXT:", resp.text)
-
     except requests.exceptions.RequestException as e:
-        import traceback
-        traceback.print_exc()
-        raise
+        raise BridgeUnavailableError(f"Could not reach storage bridge at {BRIDGE_BASE_URL}{path}: {e}")
 
     if resp.status_code == 401:
         raise BridgeUnavailableError(
@@ -82,13 +92,11 @@ def _post(path: str, **kwargs) -> dict:
         )
 
     # Any other 4xx means the bridge understood the request but rejected
-    # it as invalid (e.g. an expired password reset token) -- raise
-    # BridgeRequestError with the bridge's own message instead of letting
-    # raise_for_status() below throw an opaque HTTPError. None of the
-    # existing routes (create_account, verify_password, etc.) ever return
-    # a 4xx for normal "wrong answer" cases -- they return {"success":
-    # False} / {"valid": False} in a 200 instead -- so this only starts
-    # mattering for reset_password() below.
+    # it as invalid -- e.g. an expired password reset token, an inactive
+    # subscription (402), a tier that's too low for this feature (403),
+    # or a daily usage cap hit (429). Raise BridgeRequestError with the
+    # bridge's own message instead of letting raise_for_status() below
+    # throw an opaque HTTPError.
     if 400 <= resp.status_code < 500:
         try:
             detail = resp.json().get("detail", f"Request failed ({resp.status_code})")
@@ -101,22 +109,16 @@ def _post(path: str, **kwargs) -> dict:
 
 
 def _get(path: str, **kwargs) -> dict:
+    timeout = kwargs.pop("timeout", REQUEST_TIMEOUT)
     try:
         resp = requests.get(
             f"{BRIDGE_BASE_URL}{path}",
             headers=_headers(),
-            timeout=REQUEST_TIMEOUT,
+            timeout=timeout,
             **kwargs,
         )
-
-        print("GET:", f"{BRIDGE_BASE_URL}{path}")
-        print("STATUS:", resp.status_code)
-        print("TEXT:", resp.text)
-
     except requests.exceptions.RequestException as e:
-        import traceback
-        traceback.print_exc()
-        raise
+        raise BridgeUnavailableError(f"Could not reach storage bridge at {BRIDGE_BASE_URL}{path}: {e}")
 
     if resp.status_code == 401:
         raise BridgeUnavailableError(
@@ -245,6 +247,70 @@ def delete_file(username: str, subject: str, filename: str) -> None:
 
 
 # ---------------------------------------------------------------------
+# AI / LLM proxy (gated by _require_active_subscription + _require_tier
+# on the bridge side -- see storage_bridge.py's /ollama/chat and
+# /ollama/generate routes). ALL LLM calls from the app must go through
+# these two functions, not straight to Ollama, or the tier/subscription
+# system has no effect (this was the root cause of the tier bug).
+# ---------------------------------------------------------------------
+def ollama_chat(username: str, model: str, messages: list) -> dict:
+    """
+    messages: list of {"role": "user"|"assistant"|"system", "content": str}
+    Raises BridgeRequestError(status_code=402) if the account isn't active,
+    403 if the tier is too low for "ai_chat", 429 if today's daily cap is
+    hit. Returns the raw Ollama chat response dict (same shape Ollama's
+    own /api/chat returns), e.g. result["message"]["content"].
+    """
+    return _post(
+        "/ollama/chat",
+        json={"username": username, "model": model, "messages": messages},
+        timeout=LLM_REQUEST_TIMEOUT,
+    )
+
+
+def ollama_generate(username: str, model: str, prompt: str, system: str = None) -> dict:
+    """
+    Same gating as ollama_chat(). Returns the raw Ollama generate response
+    dict, e.g. result["response"].
+    """
+    payload = {"username": username, "model": model, "prompt": prompt}
+    if system:
+        payload["system"] = system
+    return _post("/ollama/generate", json=payload, timeout=LLM_REQUEST_TIMEOUT)
+
+
+def get_usage_today(username: str) -> dict:
+    """Returns {"tier": str, "usage": {feature: {"used", "cap", "remaining"}}} --
+    lets the UI show 'you've used 7/10 chat messages today'."""
+    return _get("/usage/today", params={"username": username})
+
+
+# ---------------------------------------------------------------------
+# Quiz attempts (practice vs test mode, server-enforced timer + gating)
+# ---------------------------------------------------------------------
+def start_quiz_attempt(username: str, subject: str = None, mode: str = "practice",
+                        timer_seconds: int = None) -> dict:
+    """
+    mode="test" requires the "test_mode" tier gate on the bridge and a
+    positive timer_seconds. Raises BridgeRequestError(402/403) if the
+    account is inactive or under-tiered for test mode.
+    """
+    payload = {"username": username, "mode": mode}
+    if subject:
+        payload["subject"] = subject
+    if timer_seconds is not None:
+        payload["timer_seconds"] = timer_seconds
+    return _post("/quiz/start_attempt", json=payload)
+
+
+def submit_quiz_attempt(attempt_id: int, username: str, score: float, max_score: float) -> dict:
+    return _post(
+        "/quiz/submit_attempt",
+        json={"attempt_id": attempt_id, "username": username, "score": score, "max_score": max_score},
+    )
+
+
+# ---------------------------------------------------------------------
 # Question Papers
 # ---------------------------------------------------------------------
 def list_papers(username: str, subject: str = None) -> list:
@@ -300,13 +366,19 @@ def get_paper(paper_id: int) -> dict:
 
 
 def start_paper_attempt(username: str, paper_id: int, mode: str, timer_seconds: int = None) -> dict:
+    """
+    Requires the "question_paper" tier gate on the bridge (and "test_mode"
+    too, if mode == "test"). Raises BridgeRequestError(402/403) if the
+    account is inactive or under-tiered.
+    """
     payload = {"username": username, "paper_id": paper_id, "mode": mode}
     if timer_seconds is not None:
         payload["timer_seconds"] = timer_seconds
     return _post("/papers/start_attempt", json=payload)
 
 
-def submit_paper_attempt(attempt_id: int, username: str, answers: list, lang: str = "English") -> dict:
+def submit_paper_attempt(attempt_id: int, username: str, answers: list,
+                          lang: str = "English", negative_marking: bool = False) -> dict:
     """
     answers: list of dicts, each shaped like:
         {"question_id": int, "answer_text": str|None, "answer_blanks": list|None,
@@ -316,7 +388,10 @@ def submit_paper_attempt(attempt_id: int, username: str, answers: list, lang: st
     """
     return _post(
         "/papers/submit_attempt",
-        json={"attempt_id": attempt_id, "username": username, "answers": answers, "lang": lang},
+        json={
+            "attempt_id": attempt_id, "username": username, "answers": answers,
+            "lang": lang, "negative_marking": negative_marking,
+        },
     )
 
 
@@ -334,6 +409,7 @@ def get_theme_color(username: str) -> str:
 
 def set_theme_color(username: str, theme_color: str) -> None:
     _post("/users/theme_color", json={"username": username, "theme_color": theme_color})
+
 
 # ---------------------------------------------------------------------
 # Tutorial-completed flag (persists per-account, same pattern as theme_color)
