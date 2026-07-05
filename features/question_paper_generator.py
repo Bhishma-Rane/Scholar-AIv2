@@ -40,6 +40,21 @@ up to MAX_ITEM_ATTEMPTS tries. If a call fails outright (timeout, bad
 JSON, empty list), that's also just one attempt -- it gets retried like
 any other shortfall rather than immediately giving up on the whole
 question type.
+
+CHANGE LOG (this revision):
+  - get_llm() now requires username -- generate_question_paper() passes
+    its own `username` argument straight through, since it already had
+    it. This is what routes generation through storage_bridge.py's
+    /ollama/chat (via core/llm.py's BridgeChatLLM), where
+    _require_active_subscription() + _require_tier(username,
+    "question_paper") actually run.
+  - BridgeRequestError raised by an under-tiered/inactive user is no
+    longer swallowed into a generic "couldn't connect" ValueError --
+    generate_question_paper() now catches it explicitly near the top
+    (right after getting the LLM) and re-raises it as-is, so callers in
+    the UI layer can catch BridgeRequestError specifically and show
+    e.detail (e.g. "This feature requires gold tier or higher...")
+    instead of a confusing generic failure message.
 """
 import json
 
@@ -47,7 +62,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from core.llm import get_llm, invoke_with_timeout
 from core.vectorstore import get_chapter_text
-from core.bridge_client import create_paper, add_paper_section, add_paper_question, BridgeRequestError
+from bridge_client import create_paper, add_paper_section, add_paper_question, BridgeRequestError, BridgeUnavailableError
 
 # The five types the in-app answer screen (ui/tab_question_paper.py) can
 # actually render an input for. case_based is a container whose
@@ -461,6 +476,13 @@ def _generate_item_questions(llm, chapter_text: str, chapter: str, language: str
     same way: as a shortfall of the full count, retried like any other,
     rather than immediately abandoning the whole question type.
 
+    Does NOT catch BridgeRequestError/BridgeUnavailableError -- if the
+    bridge rejects the very first call in this item (inactive
+    subscription, tier too low, daily cap hit), retrying with more calls
+    won't change that outcome, so the exception is left to propagate up
+    to generate_question_paper(), which handles it once for the whole
+    paper instead of once per item.
+
     Each candidate question is validated with _validate_generated_question
     before it counts toward the target, so a malformed question doesn't
     fill a "slot" that a retry could have filled with something usable.
@@ -536,13 +558,20 @@ def generate_question_paper(
 
     Raises ValueError if question_counts is invalid/empty/too large, the
     chapter text is missing, the LLM is unreachable, or literally every
-    question type failed to generate. Raises BridgeRequestError/
-    BridgeUnavailableError only for the initial paper-shell creation
-    call -- there's no point generating content if we can't even open
-    the shell. Once the shell exists, individual bad questions are
-    skipped rather than raised, since one malformed question from the
-    LLM shouldn't blow away an otherwise-good paper that's already
-    partially built.
+    question type failed to generate.
+
+    Raises BridgeRequestError if the bridge rejects generation outright
+    -- inactive subscription (402), tier too low for "question_paper"
+    (403), or a daily cap (429) -- letting the UI layer catch it
+    specifically and show e.detail (the bridge's own human-readable
+    reason) rather than a generic failure. Raises BridgeUnavailableError
+    if the bridge can't be reached at all. Both are raised for the
+    initial paper-shell creation call too -- there's no point generating
+    content if we can't even open the shell. Once the shell exists,
+    individual bad questions are skipped (via BridgeRequestError caught
+    locally in the loop below) rather than raised, since one malformed
+    question from the LLM shouldn't blow away an otherwise-good paper
+    that's already partially built.
     """
     cleaned_counts = _validate_question_counts(question_counts or DEFAULT_QUESTION_COUNTS)
     plan = _build_section_plan(cleaned_counts)
@@ -558,12 +587,20 @@ def generate_question_paper(
     # call; with retries this means several small, fast calls per item
     # instead of one huge one that silently truncates.
     ITEM_TIMEOUT_SECONDS = 75
-    llm = get_llm(model_type="paper", request_timeout=ITEM_TIMEOUT_SECONDS)
+    llm = get_llm(model_type="paper", username=username, request_timeout=ITEM_TIMEOUT_SECONDS)
     if llm is None:
         raise ValueError("Could not connect to the LLM.")
 
     generated_sections = []  # [{"title", "instructions", "questions": [...]}]
     failed_item_labels = []
+
+    # BridgeRequestError/BridgeUnavailableError raised anywhere in this
+    # loop (i.e. on the FIRST LLM call for the paper) means the user
+    # isn't allowed to generate a paper at all -- let it propagate
+    # straight out of generate_question_paper() rather than getting
+    # caught by anything below, so the UI shows the bridge's real reason
+    # (e.g. "This feature requires gold tier or higher...") instead of a
+    # generic "couldn't generate any questions" message.
     for section in plan:
         section_questions = []
         for item in section["items"]:
@@ -592,7 +629,11 @@ def generate_question_paper(
             "(every question type failed or timed out). Try generating again, or with fewer questions."
         )
 
-    # Paper shell first -- if THIS call fails, nothing partial gets left behind.
+    # Paper shell first -- if THIS call fails, nothing partial gets left
+    # behind. Also gated by the bridge (question_paper tier), but by this
+    # point we've already succeeded on generation calls above, so a
+    # failure here would be unusual (e.g. tier downgraded mid-generation)
+    # -- still let it propagate rather than masking it.
     created = create_paper(username=username, title=title, subject=subject)
     paper_id = created["paper_id"]
 
