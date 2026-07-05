@@ -40,7 +40,7 @@ from langchain_core.messages import BaseMessage
 from langgraph.graph import StateGraph, START, END
 
 from core.llm import get_llm, invoke_with_timeout, internet_search
-from bridge_client import BridgeRequestError, BridgeUnavailableError
+from core.bridge_client import BridgeRequestError, BridgeUnavailableError
 from core.paths import get_chapter_paths
 from core.vectorstore import get_vector_store, get_chapter_text
 from features.mock_exams import extract_clean_json
