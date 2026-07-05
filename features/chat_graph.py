@@ -11,6 +11,24 @@ Flow:
 retrieve_verses parses the user's command (!mcq, !summary, "ver X ! quiz N", etc.),
 fetches context either from the local vector store, a specific chapter's raw text,
 or the internet, then routes to the right generation node.
+
+CHANGE LOG (this revision):
+  - get_llm() calls now pass username=state["username"] -- required since
+    core/llm.py's BridgeChatLLM routes every call through
+    storage_bridge.py's /ollama/chat, which enforces
+    _require_active_subscription() + _require_tier(). Without a
+    username, get_llm() refuses to hand back an LLM at all.
+  - generate_standard_modes no longer uses LangChain's `prompt | llm |
+    StrOutputParser()` pipe syntax. BridgeChatLLM (core/llm.py) is a
+    plain Python object, not a LangChain Runnable, so it can't be piped
+    into. The prompt is now rendered to a message list via
+    ChatPromptTemplate.invoke(...).to_messages() and passed to
+    llm.invoke_messages() directly -- this preserves multi-turn
+    chat_history exactly as before, just without the pipe operator.
+  - Both generation nodes now catch BridgeRequestError (raised when the
+    bridge rejects a call -- inactive subscription, tier too low, daily
+    cap hit) and surface its .detail message as the chat response,
+    instead of letting an uncaught exception blow up the graph node.
 """
 import re
 import json
@@ -19,10 +37,10 @@ from typing import TypedDict, List
 
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import BaseMessage
-from langchain_core.output_parsers import StrOutputParser
 from langgraph.graph import StateGraph, START, END
 
-from core.llm import get_llm, internet_search
+from core.llm import get_llm, invoke_with_timeout, internet_search
+from bridge_client import BridgeRequestError, BridgeUnavailableError
 from core.paths import get_chapter_paths
 from core.vectorstore import get_vector_store, get_chapter_text
 from features.mock_exams import extract_clean_json
@@ -168,7 +186,10 @@ def generate_standard_modes(state: AgentState):
     """Handles all conversational / single-question commands plus plain chat."""
     mode, lang = state["command_mode"], state["language"]
 
-    llm = get_llm()
+    llm = get_llm(username=state["username"])
+    if llm is None:
+        return {"response": "Could not start a chat session — please log in again and retry."}
+
     prompt = ChatPromptTemplate.from_messages(
         [
             (
@@ -179,13 +200,33 @@ def generate_standard_modes(state: AgentState):
             ("human", "{question}"),
         ]
     )
-    answer = (prompt | llm | StrOutputParser()).invoke(
+
+    # Render the template to an actual list of messages (system + prior
+    # chat_history + this turn's human message) WITHOUT piping into the
+    # LLM -- BridgeChatLLM isn't a LangChain Runnable, so `prompt | llm`
+    # doesn't work here. invoke_messages() takes that rendered list
+    # directly, so multi-turn history is preserved exactly as before.
+    rendered_messages = prompt.invoke(
         {
             "context": state["context"],
             "chat_history": state["chat_history"],
             "question": state["question"],
         }
-    )
+    ).to_messages()
+
+    try:
+        answer = invoke_with_timeout(llm, rendered_messages, timeout_seconds=60)
+    except BridgeRequestError as e:
+        # Inactive subscription (402), tier too low for "ai_chat" (403),
+        # or today's daily chat cap hit (429) -- show the bridge's own
+        # message rather than crashing the graph node.
+        return {"response": e.detail}
+    except BridgeUnavailableError as e:
+        return {"response": f"Couldn't reach the AI backend: {e}"}
+
+    if answer is None:
+        return {"response": "The AI backend timed out. Please try again."}
+
     return {"response": answer + f"\n\n*Source: {state.get('source_file', 'Unknown')}*"}
 
 
@@ -293,6 +334,13 @@ def _generate_questions_for_chunk(quiz_llm, chunk_text: str, n: int, lang: str, 
     Requests `n` questions grounded in a single chunk of text. Retries up to
     `max_retries` times on timeout/parse failure. Returns a list of valid,
     deduplicated question dicts (length <= n).
+
+    Does NOT catch BridgeRequestError/BridgeUnavailableError -- those
+    indicate the CALLER isn't allowed to generate quizzes at all (inactive
+    subscription, tier too low, daily cap hit), which no amount of
+    retrying will fix. They propagate up to generate_dynamic_quiz_files(),
+    which surfaces the bridge's message directly instead of quietly
+    burning through retries on a request that will never succeed.
     """
     from core.llm import invoke_with_timeout
 
@@ -308,13 +356,9 @@ def _generate_questions_for_chunk(quiz_llm, chunk_text: str, n: int, lang: str, 
         quiz_inst = QUIZ_INSTRUCTION_TEMPLATE.format(n=still_needed, lang=lang)
         full_prompt = f"{quiz_inst}\n\nContext:\n{chunk_text}"
 
-        try:
-            raw_out = invoke_with_timeout(quiz_llm, full_prompt, timeout_seconds=QUIZ_CALL_TIMEOUT)
-            if raw_out is None:
-                print(f"[ScholarAI] Chunk call timed out (attempt {attempts}/{max_retries + 1})")
-                continue
-        except Exception as e:
-            print(f"[ScholarAI] Chunk call error: {type(e).__name__}: {e}")
+        raw_out = invoke_with_timeout(quiz_llm, full_prompt, timeout_seconds=QUIZ_CALL_TIMEOUT)
+        if raw_out is None:
+            print(f"[ScholarAI] Chunk call timed out (attempt {attempts}/{max_retries + 1})")
             continue
 
         try:
@@ -367,7 +411,7 @@ def generate_dynamic_quiz_files(state: AgentState):
     full_context = state["context"] or ""
     target_count = state["quiz_count"]
 
-    quiz_llm = get_llm("quiz")
+    quiz_llm = get_llm("quiz", username=state["username"])
     if not quiz_llm:
         return {"response": "Generation failed: LLM engine offline."}
 
@@ -437,6 +481,13 @@ def generate_dynamic_quiz_files(state: AgentState):
         print(f"[ScholarAI] \u2713 Saved {len(all_questions)} questions to {safe_verse}_Data.json")
         return {"response": f"Successfully generated {len(all_questions)} questions!{shortfall_note}"}
 
+    except BridgeRequestError as e:
+        # Inactive subscription (402), tier too low for "quiz_generation"
+        # (403), or today's daily quiz-generation cap hit (429). No
+        # amount of retrying fixes this -- surface the bridge's message.
+        return {"response": e.detail}
+    except BridgeUnavailableError as e:
+        return {"response": f"Couldn't reach the AI backend: {e}"}
     except Exception as e:
         print(f"[ScholarAI] Fatal error in generate_dynamic_quiz_files: {str(e)}")
         return {"response": f"JSON Formatting Failed. Try again. Error: {str(e)}"}
