@@ -115,8 +115,7 @@ MAX_TOTAL_QUESTIONS = 60
 # missing. 3 gives the model two chances to make up a shortfall without
 # letting one stubborn type blow up the total time budget for the paper
 # (worst case: MAX_ITEM_ATTEMPTS calls * ITEM_TIMEOUT_SECONDS per item).
-MAX_ITEM_ATTEMPTS = 3
-
+MAX_ITEM_ATTEMPTS = 1
 
 def estimate_total_marks(question_counts: dict) -> int:
     """
@@ -586,7 +585,7 @@ def generate_question_paper(
     # ONE TYPE's worth of questions per call. ITEM_TIMEOUT_SECONDS is per
     # call; with retries this means several small, fast calls per item
     # instead of one huge one that silently truncates.
-    ITEM_TIMEOUT_SECONDS = 75
+    ITEM_TIMEOUT_SECONDS = 25
     llm = get_llm(model_type="paper", username=username, request_timeout=ITEM_TIMEOUT_SECONDS)
     if llm is None:
         raise ValueError("Could not connect to the LLM.")
