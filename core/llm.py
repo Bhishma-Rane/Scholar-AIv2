@@ -4,6 +4,12 @@ core/llm.py
 Lazy-loaded LLM access and the shared internet/image search tools.
 
 CHANGE LOG (this revision):
+  - Added embed_texts() -- the embeddings-side counterpart to
+    BridgeChatLLM. Routes embedding requests through
+    storage_bridge.py's /ollama/embed route (via
+    bridge_client.ollama_embed()) instead of calling Ollama directly.
+    Used by core/vectorstore.py's BridgeEmbeddings.
+
   - BridgeChatLLM now ACTUALLY ATTEMPTS to forward `num_predict` (as an
     `options={"num_predict": ...}` kwarg) and JSON mode (as a `format=
     "json"` kwarg) to bridge_client.ollama_chat(). Previously num_predict
@@ -18,15 +24,10 @@ CHANGE LOG (this revision):
 
   - THIS ONLY TAKES EFFECT IF bridge_client.ollama_chat() AND
     storage_bridge.py's /ollama/chat ROUTE ARE ALSO UPDATED to accept
-    and forward `options` and `format`. Neither of those files is
-    edited here (they're not in front of me) -- see the TODO block near
-    _invoke_messages_raw for exactly what needs to change in each, with
-    a concrete snippet. Until that's done, calls to bridge_client.
-    ollama_chat() with these new kwargs will raise TypeError, which is
-    caught here and silently retried WITHOUT them (once-per-process
-    warning printed, not per-call, so this doesn't spam logs) -- i.e.
-    today's behavior is preserved exactly until the bridge side catches
-    up.
+    and forward `options` and `format`. Both have since been updated
+    (see bridge_client.py and storage_bridge.py) -- the TypeError
+    fallback below is now dead code for that reason, but left in place
+    as a safety net in case those two files ever regress.
 
   - invoke(), invoke_messages(), and invoke_with_timeout() all gained an
     optional `json_mode: bool = False` parameter that threads down to
@@ -169,14 +170,6 @@ class BridgeChatLLM:
         self.model = model
         self.username = username
         self.system = system
-        # num_predict is now ACTUALLY FORWARDED (as options={"num_predict":
-        # ...}) -- see _invoke_messages_raw -- as long as bridge_client.
-        # ollama_chat() and storage_bridge.py's /ollama/chat route accept
-        # the kwarg. If they don't yet, it's silently dropped with a
-        # one-time warning rather than erroring, so this file works
-        # standalone before the rest of the chain is updated. See the
-        # TODO in _invoke_messages_raw for what to change in those two
-        # files to make this real end-to-end.
         self.num_predict = num_predict
 
     def invoke(self, prompt: str, json_mode: bool = False) -> _LLMResponse:
@@ -199,7 +192,44 @@ class BridgeChatLLM:
         normalized = [_normalize_message(m) for m in messages]
         return self._invoke_messages_raw(normalized, json_mode=json_mode)
 
-    def embed_texts(username: str, texts: list, model: Optional[str] = None) -> list:
+    def _invoke_messages_raw(self, messages: list, json_mode: bool = False) -> _LLMResponse:
+        global _warned_bridge_missing_kwargs
+
+        kwargs = {}
+        if self.num_predict:
+            kwargs["options"] = {"num_predict": self.num_predict}
+        if json_mode:
+            kwargs["format"] = "json"
+
+        try:
+            result = bridge_client.ollama_chat(
+                username=self.username,
+                model=self.model,
+                messages=messages,
+                **kwargs,
+            )
+        except TypeError:
+            if kwargs and not _warned_bridge_missing_kwargs:
+                print(
+                    "[ScholarAI] bridge_client.ollama_chat() doesn't accept options/format yet "
+                    "-- num_predict and json_mode are being silently ignored until "
+                    "bridge_client.py and storage_bridge.py's /ollama/chat route are updated "
+                    "to forward them."
+                )
+                _warned_bridge_missing_kwargs = True
+            result = bridge_client.ollama_chat(
+                username=self.username,
+                model=self.model,
+                messages=messages,
+            )
+
+        # storage_bridge.py's /ollama/chat proxies Ollama's own response
+        # shape verbatim: {"message": {"role": "assistant", "content": "..."}, ...}
+        content = result.get("message", {}).get("content", "")
+        return _LLMResponse(content)
+
+
+def embed_texts(username: str, texts: list, model: Optional[str] = None) -> list:
     """
     Routes embedding requests through storage_bridge.py's /ollama/embed
     route instead of calling Ollama directly -- the embeddings-side
@@ -223,84 +253,6 @@ class BridgeChatLLM:
     )
     return result["embeddings"]
 
-    def _invoke_messages_raw(self, messages: list, json_mode: bool = False) -> _LLMResponse:
-        global _warned_bridge_missing_kwargs
-
-        kwargs = {}
-        if self.num_predict:
-            kwargs["options"] = {"num_predict": self.num_predict}
-        if json_mode:
-            kwargs["format"] = "json"
-
-        # ------------------------------------------------------------------
-        # TODO (bridge_client.py / storage_bridge.py) -- for `kwargs` above
-        # to actually reach Ollama instead of being dropped by the TypeError
-        # fallback below, both of these need updating:
-        #
-        # 1. bridge_client.py's ollama_chat() needs to accept and forward
-        #    `options` and `format`:
-        #
-        #     def ollama_chat(username, model, messages, options=None, format=None):
-        #         payload = {"username": username, "model": model, "messages": messages}
-        #         if options is not None:
-        #             payload["options"] = options
-        #         if format is not None:
-        #             payload["format"] = format
-        #         ... existing POST to storage_bridge.py's /ollama/chat ...
-        #
-        # 2. storage_bridge.py's OllamaChatRequest pydantic model and the
-        #    /ollama/chat route need the matching fields, forwarded into the
-        #    actual Ollama /api/chat call:
-        #
-        #     class OllamaChatRequest(BaseModel):
-        #         username: str
-        #         model: str
-        #         messages: list
-        #         options: dict | None = None
-        #         format: str | None = None
-        #
-        #     @app.post("/ollama/chat")
-        #     def ollama_chat_route(req: OllamaChatRequest):
-        #         ...
-        #         ollama_payload = {"model": req.model, "messages": req.messages, "stream": False}
-        #         if req.options:
-        #             ollama_payload["options"] = req.options
-        #         if req.format:
-        #             ollama_payload["format"] = req.format
-        #         resp = httpx.post(f"{OLLAMA_BASE_URL}/api/chat", json=ollama_payload, ...)
-        #
-        # Until both are in place, the call below raises TypeError (extra
-        # kwargs bridge_client.ollama_chat doesn't accept yet), which is
-        # caught and retried without them -- so this degrades to exactly
-        # today's behavior rather than crashing.
-        # ------------------------------------------------------------------
-        try:
-            result = bridge_client.ollama_chat(
-                username=self.username,
-                model=self.model,
-                messages=messages,
-                **kwargs,
-            )
-        except TypeError:
-            if kwargs and not _warned_bridge_missing_kwargs:
-                print(
-                    "[ScholarAI] bridge_client.ollama_chat() doesn't accept options/format yet "
-                    "-- num_predict and json_mode are being silently ignored until "
-                    "bridge_client.py and storage_bridge.py's /ollama/chat route are updated "
-                    "to forward them (see TODO in core/llm.py's BridgeChatLLM._invoke_messages_raw)."
-                )
-                _warned_bridge_missing_kwargs = True
-            result = bridge_client.ollama_chat(
-                username=self.username,
-                model=self.model,
-                messages=messages,
-            )
-
-        # storage_bridge.py's /ollama/chat proxies Ollama's own response
-        # shape verbatim: {"message": {"role": "assistant", "content": "..."}, ...}
-        content = result.get("message", {}).get("content", "")
-        return _LLMResponse(content)
-
 
 def invoke_with_timeout(
     llm: "BridgeChatLLM",
@@ -311,11 +263,6 @@ def invoke_with_timeout(
     """
     Call BridgeChatLLM.invoke() (if `prompt` is a string) or
     .invoke_messages() (if `prompt` is a list of messages) with a timeout.
-
-    `json_mode`, if True, is passed through to request Ollama's native
-    JSON output mode -- see BridgeChatLLM._invoke_messages_raw for what
-    else needs to be true (bridge_client.py + storage_bridge.py updates)
-    for this to have any actual effect versus being a harmless no-op.
 
     NOTE: the timeout here is a client-side thread-join safety net only
     (a bare thread.join() can't forcibly kill a stuck thread, it just
@@ -328,10 +275,8 @@ def invoke_with_timeout(
     IMPORTANT: if the bridge rejects the request (BridgeRequestError --
     inactive subscription, tier too low, daily cap hit) or is flat-out
     unreachable (BridgeUnavailableError), that exception is RE-RAISED
-    from this function, not swallowed into a None return. A caller that
-    gets None can't tell "Ollama was slow" apart from "this user isn't
-    allowed to do this" -- those need different messages shown to the
-    user, so callers of invoke_with_timeout() should wrap it in:
+    from this function, not swallowed into a None return. Callers of
+    invoke_with_timeout() should wrap it in:
 
         try:
             text = invoke_with_timeout(llm, prompt)
@@ -350,11 +295,6 @@ def invoke_with_timeout(
                 response = llm.invoke(prompt, json_mode=json_mode)
             result["content"] = response.content
         except Exception as e:
-            # Captured here (not re-raised inside the thread -- exceptions
-            # raised inside a background thread do NOT propagate to the
-            # caller's thread; they'd just print "Exception in thread" and
-            # vanish). Stored instead, and re-raised below on the main
-            # thread after join() returns.
             result["error"] = e
 
     thread = threading.Thread(target=invoke_thread, daemon=True)
@@ -406,20 +346,8 @@ def get_llm(model_type: str = "main", username: str = None, system: str = None, 
     try:
         num_predict = None
         if model_type == "quiz":
-            # Sized for a SINGLE CHUNK's worth of questions (chunked quiz
-            # generation sends many small requests rather than one giant
-            # one -- see features/chat_graph.py). Actually reaches Ollama
-            # now IF bridge_client.py/storage_bridge.py forward `options`
-            # -- see the TODO in BridgeChatLLM._invoke_messages_raw. Until
-            # then this value is set here but silently ignored downstream,
-            # same as it already was before this revision.
             num_predict = 1024
         elif model_type == "paper":
-            # Question papers generate ONE QUESTION TYPE AT A TIME (see
-            # features/question_paper_generator.py) -- 3072 tokens covers
-            # up to MAX_COUNT_PER_TYPE (25) questions of a single type.
-            # Same caveat as above: only takes effect once options is
-            # forwarded end-to-end.
             num_predict = 3072
 
         return BridgeChatLLM(model=OLLAMA_MAIN_MODEL, username=username, system=system, num_predict=num_predict)
