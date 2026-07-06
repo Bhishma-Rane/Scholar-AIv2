@@ -618,6 +618,8 @@ def _generate_item_questions(llm, chapter_text: str, chapter: str, language: str
                   f"'questions' key/list (parsed top-level keys: {list(parsed.keys())}). "
                   f"Model likely didn't follow the requested schema.")
 
+        accepted_this_attempt = 0
+        duplicates_this_attempt = 0
         rejected = 0
         for q in raw_questions or []:
             if not _validate_generated_question(q, item):
@@ -625,9 +627,11 @@ def _generate_item_questions(llm, chapter_text: str, chapter: str, language: str
                 continue
             summary = _question_summary(q)
             if summary in seen_summaries:
+                duplicates_this_attempt += 1
                 continue  # model repeated itself despite the avoid-list
             seen_summaries.add(summary)
             collected.append(q)
+            accepted_this_attempt += 1
             if len(collected) >= item["count"]:
                 break
 
@@ -635,6 +639,31 @@ def _generate_item_questions(llm, chapter_text: str, chapter: str, language: str
             print(f"[ScholarAI] paper-gen: '{item['label']}' attempt {attempts} got "
                   f"{len(raw_questions)} question(s) back, {rejected} failed client-side validation "
                   f"(wrong type/marks, or malformed 'extra' -- see _validate_generated_question).")
+
+        # This is the case the branches above don't cover: the model
+        # returned a well-formed "questions" list and every item in it
+        # individually PASSED _validate_generated_question, but every
+        # single one was a repeat of something already collected (see
+        # _question_summary's dedup) -- so nothing new got added despite
+        # no error and no rejection. Without this, that attempt would
+        # print nothing at all and just quietly loop to the next retry,
+        # which is exactly the blind spot that made this item's failure
+        # invisible in the logs.
+        if raw_questions and accepted_this_attempt == 0 and rejected == 0:
+            print(f"[ScholarAI] paper-gen: '{item['label']}' attempt {attempts} got "
+                  f"{len(raw_questions)} valid question(s) back, but all {duplicates_this_attempt} "
+                  f"were duplicates of questions already collected -- 0 new questions added this attempt.")
+
+    # Unconditional summary -- always prints exactly once per item,
+    # regardless of which path above did or didn't fire, so there's
+    # never a silent "nothing printed for this item" outcome again.
+    if len(collected) >= item["count"]:
+        print(f"[ScholarAI] paper-gen: '{item['label']}' succeeded -- {len(collected)}/{item['count']} "
+              f"question(s) collected in {attempts} attempt(s).")
+    else:
+        print(f"[ScholarAI] paper-gen: '{item['label']}' SHORTFALL -- only {len(collected)}/{item['count']} "
+              f"question(s) collected after {attempts}/{MAX_ITEM_ATTEMPTS} attempt(s). This item will be "
+              f"flagged in failed_sections.")
 
     return collected, attempts
 
