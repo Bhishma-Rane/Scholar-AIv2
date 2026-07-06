@@ -199,6 +199,30 @@ class BridgeChatLLM:
         normalized = [_normalize_message(m) for m in messages]
         return self._invoke_messages_raw(normalized, json_mode=json_mode)
 
+    def embed_texts(username: str, texts: list, model: Optional[str] = None) -> list:
+    """
+    Routes embedding requests through storage_bridge.py's /ollama/embed
+    route instead of calling Ollama directly -- the embeddings-side
+    counterpart to BridgeChatLLM. Used by core/vectorstore.py's
+    BridgeEmbeddings so Chroma indexing goes through the bridge like
+    every other AI call does.
+
+    Raises BridgeRequestError if the bridge rejects the request (inactive
+    subscription -> 402) and BridgeUnavailableError if the bridge can't
+    be reached -- same exceptions BridgeChatLLM raises, so callers can
+    handle both the same way.
+    """
+    if model is None:
+        from config import OLLAMA_EMBED_MODEL
+        model = OLLAMA_EMBED_MODEL
+
+    result = bridge_client.ollama_embed(
+        username=username,
+        model=model,
+        input=texts,
+    )
+    return result["embeddings"]
+
     def _invoke_messages_raw(self, messages: list, json_mode: bool = False) -> _LLMResponse:
         global _warned_bridge_missing_kwargs
 
