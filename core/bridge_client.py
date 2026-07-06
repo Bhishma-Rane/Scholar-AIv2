@@ -253,17 +253,29 @@ def delete_file(username: str, subject: str, filename: str) -> None:
 # these two functions, not straight to Ollama, or the tier/subscription
 # system has no effect (this was the root cause of the tier bug).
 # ---------------------------------------------------------------------
-def ollama_chat(username: str, model: str, messages: list) -> dict:
+def ollama_chat(username: str, model: str, messages: list, options: dict = None, format: str = None) -> dict:
     """
     messages: list of {"role": "user"|"assistant"|"system", "content": str}
     Raises BridgeRequestError(status_code=402) if the account isn't active,
     403 if the tier is too low for "ai_chat", 429 if today's daily cap is
     hit. Returns the raw Ollama chat response dict (same shape Ollama's
     own /api/chat returns), e.g. result["message"]["content"].
+
+    `options`, if given, is forwarded as-is to Ollama's /api/chat as its
+    per-request generation params dict -- most usefully {"num_predict":
+    N} to bound response length. `format`, if given (e.g. "json"),
+    requests Ollama's native structured-JSON output mode. Both are
+    omitted from the request body entirely when not set, so existing
+    callers that don't pass them see no change in behavior.
     """
+    payload = {"username": username, "model": model, "messages": messages}
+    if options:
+        payload["options"] = options
+    if format:
+        payload["format"] = format
     return _post(
         "/ollama/chat",
-        json={"username": username, "model": model, "messages": messages},
+        json=payload,
         timeout=LLM_REQUEST_TIMEOUT,
     )
 
