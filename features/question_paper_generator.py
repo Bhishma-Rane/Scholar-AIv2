@@ -54,13 +54,30 @@ CHANGE LOG (this revision):
     concurrently instead of waiting on each other. If the local Ollama
     instance can't actually interleave requests, this is a no-op; if it
     can, it's close to a linear speedup with item count.
-  - ATTEMPTS TO USE JSON MODE when talking to Ollama, via a `json_mode=
-    True` kwarg on invoke_with_timeout. This is guarded by a TypeError
-    fallback because core/llm.py's invoke_with_timeout doesn't
-    necessarily support the kwarg yet -- see the comment at the call
-    site for what needs to change in core/llm.py (passing Ollama's
-    `format: "json"` through BridgeChatLLM) for this to actually take
-    effect instead of silently no-op'ing back to prompt-only formatting.
+  - FIXED: a prior revision of this file had `_invoke_llm` unconditionally
+    pass `json_mode=False` to `invoke_with_timeout`, with a docstring
+    claiming this was "guarded by a TypeError fallback" -- but no such
+    guard actually existed in the code. core/llm.py's invoke_with_timeout
+    does NOT accept a `json_mode` kwarg, so every single call raised
+    `TypeError: invoke_with_timeout() got an unexpected keyword argument
+    'json_mode'` immediately, before ever reaching Ollama. That TypeError
+    propagated out of _generate_item_questions (which had no try/except
+    around the _invoke_llm call itself -- only around the JSON-extraction
+    step after it), and was caught by the broad `except Exception` in
+    _generate_all_items's as_completed loop, which logged it and recorded
+    the item as "0 questions, skipped." Every item hit the identical
+    TypeError, so every item silently produced 0 questions, so
+    generated_sections ended up empty, which is exactly what surfaces as
+    "The model's response couldn't be turned into any valid questions
+    (every question type failed or timed out)" with no more specific
+    error visible unless you were watching stdout for the per-item
+    "raised an unexpected TypeError" log lines.
+    Fix applied: _invoke_llm no longer passes json_mode at all. Ollama
+    JSON mode was already established (see _invoke_llm's docstring below)
+    to often make llama3 return SOME valid JSON but not necessarily the
+    {"questions": [...]} shape this prompt asks for, so re-wiring it
+    through core/llm.py isn't worth doing right now -- simplest correct
+    fix is to just not pass the kwarg until/unless that's revisited.
   - CHAPTER TEXT IS NOW CACHED in-process (see _get_chapter_text_cached)
     so generating a second paper from the same chapter within the cache
     TTL skips the vectorstore/read/split round trip entirely.
@@ -430,25 +447,37 @@ def _extract_json(raw: str) -> dict:
 
 def _invoke_llm(llm, prompt: str, timeout_seconds: int):
     """
-    Wraps invoke_with_timeout. json_mode is OFF by default here -- see
-    below.
+    Thin wrapper around invoke_with_timeout.
 
-    Ollama's format="json" mode was tried in an earlier revision to cut
-    down on markdown-fenced/chatty responses, but in practice this can
-    make things WORSE for a schema this specific: strict JSON mode makes
-    llama3 much more likely to return valid JSON in SOME shape, but not
-    necessarily the {"questions": [...]} shape the prompt asks for --
-    the model tends to fall back to whatever its own default JSON
-    instinct is rather than actually following the prompt's schema, and
-    since that's still syntactically valid JSON, _extract_json succeeds
-    and the failure only shows up as "0 valid questions" with nothing to
-    debug (parsed.get("questions") is just missing or empty). Left as an
-    opt-in below rather than removed outright -- if you want to
-    experiment with it again, change json_mode=False to True, but watch
-    the new logging in _generate_item_questions to see whether
-    "questions" is actually coming back this time.
+    NOTE: this does NOT pass a json_mode kwarg. Ollama's format="json"
+    mode was tried in an earlier revision to cut down on markdown-fenced/
+    chatty responses, but two problems ruled it out:
+
+      1. core/llm.py's invoke_with_timeout doesn't accept a json_mode
+         kwarg at all right now -- passing one unconditionally raised
+         TypeError on every single call, which silently zeroed out every
+         question type in the paper (caught far upstream by the generic
+         `except Exception` in _generate_all_items, logged as "raised an
+         unexpected TypeError", and surfaced to the user only as "every
+         question type failed or timed out" with no obvious cause).
+      2. Even if that plumbing existed, strict JSON mode makes llama3
+         much more likely to return valid JSON in SOME shape, but not
+         necessarily the {"questions": [...]} shape this prompt asks
+         for -- the model tends to fall back to its own default JSON
+         instinct rather than following the prompt's schema. That's
+         still syntactically valid JSON, so _extract_json succeeds, and
+         the failure only shows up downstream as "0 valid questions"
+         with nothing obvious to debug (parsed.get("questions") is just
+         missing or empty).
+
+    If core/llm.py is ever updated to genuinely support json_mode (i.e.
+    routing Ollama's `format: "json"` through BridgeChatLLM) AND a
+    prompt/schema fix addresses point 2 above, this is the place to wire
+    it back in -- ideally behind a feature flag and with the per-item
+    logging in _generate_item_questions watched closely to confirm
+    "questions" actually comes back non-empty.
     """
-    return invoke_with_timeout(llm, prompt, timeout_seconds=timeout_seconds, json_mode=False)
+    return invoke_with_timeout(llm, prompt, timeout_seconds=timeout_seconds)
 
 
 def _validate_question_extra_clientside(qtype: str, extra: dict) -> bool:
