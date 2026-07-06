@@ -346,7 +346,6 @@ from langchain_community.document_loaders import TextLoader, PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from config import OLLAMA_EMBED_MODEL
-from core.paths import get_user_paths, sanitize_filename
 from core import bridge_client
 from core.bridge_client import BridgeUnavailableError
 from core.llm import embed_texts
