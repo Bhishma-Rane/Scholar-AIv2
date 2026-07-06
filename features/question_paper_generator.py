@@ -690,10 +690,31 @@ def _generate_all_items(
         }
         for future in as_completed(future_to_key):
             section_title, label, target = future_to_key[future]
-            # Propagate BridgeRequestError/BridgeUnavailableError as-is --
-            # same contract _generate_item_questions already documents,
-            # just surfaced through .result() instead of a direct call.
-            questions, attempts = future.result()
+            # BridgeRequestError/BridgeUnavailableError still propagate
+            # as-is -- same contract _generate_item_questions already
+            # documents, just surfaced through .result() instead of a
+            # direct call. Those mean "this user isn't allowed to
+            # generate at all" (inactive subscription, tier too low,
+            # daily cap, bridge unreachable), and retrying other items
+            # wouldn't change that, so the whole paper should stop.
+            #
+            # Anything else (a plain bug -- e.g. a version-mismatch
+            # TypeError between this file and core/llm.py, a KeyError
+            # from a malformed response, etc.) is caught here instead of
+            # being allowed to blow up the entire generate_question_paper()
+            # call. One item hitting an unexpected bug shouldn't take a
+            # paper that's otherwise generating fine down with it -- it's
+            # treated exactly like an item that came back with zero
+            # questions (logged, flagged in failed_item_labels), not a
+            # fatal error for the whole request.
+            try:
+                questions, attempts = future.result()
+            except (BridgeRequestError, BridgeUnavailableError):
+                raise
+            except Exception as e:
+                print(f"[ScholarAI] paper-gen: '{label}' raised an unexpected "
+                      f"{type(e).__name__} and was skipped: {e}")
+                questions, attempts = [], 0
             results_by_key[(section_title, label)] = questions
             if progress_callback:
                 try:
