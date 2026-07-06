@@ -430,25 +430,25 @@ def _extract_json(raw: str) -> dict:
 
 def _invoke_llm(llm, prompt: str, timeout_seconds: int):
     """
-    Wraps invoke_with_timeout with an attempt to request Ollama's native
-    JSON mode (format="json"), which makes the model far less likely to
-    wrap its answer in markdown fences or chatty preamble -- the exact
-    failure mode _find_json_object/_extract_json exist to route around.
+    Wraps invoke_with_timeout. json_mode is OFF by default here -- see
+    below.
 
-    core/llm.py's invoke_with_timeout may not support a `json_mode`
-    kwarg yet (it needs to thread `format: "json"` through to the
-    underlying Ollama /api/chat call inside BridgeChatLLM for this to
-    actually do anything). Rather than require that change be made
-    everywhere at once, this call is guarded by a TypeError fallback: if
-    the kwarg isn't accepted, it retries the plain call. Once core/llm.py
-    is updated to accept and forward json_mode, this starts working
-    automatically with no further change here.
+    Ollama's format="json" mode was tried in an earlier revision to cut
+    down on markdown-fenced/chatty responses, but in practice this can
+    make things WORSE for a schema this specific: strict JSON mode makes
+    llama3 much more likely to return valid JSON in SOME shape, but not
+    necessarily the {"questions": [...]} shape the prompt asks for --
+    the model tends to fall back to whatever its own default JSON
+    instinct is rather than actually following the prompt's schema, and
+    since that's still syntactically valid JSON, _extract_json succeeds
+    and the failure only shows up as "0 valid questions" with nothing to
+    debug (parsed.get("questions") is just missing or empty). Left as an
+    opt-in below rather than removed outright -- if you want to
+    experiment with it again, change json_mode=False to True, but watch
+    the new logging in _generate_item_questions to see whether
+    "questions" is actually coming back this time.
     """
-    try:
-        return invoke_with_timeout(llm, prompt, timeout_seconds=timeout_seconds, json_mode=True)
-    except TypeError:
-        # invoke_with_timeout in core/llm.py doesn't accept json_mode yet.
-        return invoke_with_timeout(llm, prompt, timeout_seconds=timeout_seconds)
+    return invoke_with_timeout(llm, prompt, timeout_seconds=timeout_seconds, json_mode=False)
 
 
 def _validate_question_extra_clientside(qtype: str, extra: dict) -> bool:
@@ -602,14 +602,26 @@ def _generate_item_questions(llm, chapter_text: str, chapter: str, language: str
         raw = _invoke_llm(llm, prompt, timeout_seconds=timeout_seconds)
         attempts += 1
         if raw is None:
+            print(f"[ScholarAI] paper-gen: '{item['label']}' attempt {attempts} timed out or errored "
+                  f"(invoke_with_timeout returned None) -- see LLM timeout/error log line above.")
             continue  # timed out -- try again rather than giving up on the type
         try:
             parsed = _extract_json(raw)
-        except (ValueError, json.JSONDecodeError):
+        except (ValueError, json.JSONDecodeError) as e:
+            print(f"[ScholarAI] paper-gen: '{item['label']}' attempt {attempts} JSON extraction failed: "
+                  f"{e}. Raw response (first 300 chars): {raw[:300]!r}")
             continue  # bad JSON this round -- try again
 
-        for q in parsed.get("questions") or []:
+        raw_questions = parsed.get("questions")
+        if not raw_questions:
+            print(f"[ScholarAI] paper-gen: '{item['label']}' attempt {attempts} parsed JSON but found no "
+                  f"'questions' key/list (parsed top-level keys: {list(parsed.keys())}). "
+                  f"Model likely didn't follow the requested schema.")
+
+        rejected = 0
+        for q in raw_questions or []:
             if not _validate_generated_question(q, item):
+                rejected += 1
                 continue
             summary = _question_summary(q)
             if summary in seen_summaries:
@@ -618,6 +630,11 @@ def _generate_item_questions(llm, chapter_text: str, chapter: str, language: str
             collected.append(q)
             if len(collected) >= item["count"]:
                 break
+
+        if rejected:
+            print(f"[ScholarAI] paper-gen: '{item['label']}' attempt {attempts} got "
+                  f"{len(raw_questions)} question(s) back, {rejected} failed client-side validation "
+                  f"(wrong type/marks, or malformed 'extra' -- see _validate_generated_question).")
 
     return collected, attempts
 
