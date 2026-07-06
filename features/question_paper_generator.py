@@ -42,6 +42,35 @@ any other shortfall rather than immediately giving up on the whole
 question type.
 
 CHANGE LOG (this revision):
+  - MAX_ITEM_ATTEMPTS restored to 3 (was accidentally left at 1, which
+    meant the "retry the shortfall" machinery described above and in
+    _generate_item_questions's own docstring never actually ran -- a
+    short first call just became the final, silently-short result).
+  - ITEMS ACROSS THE WHOLE PAPER NOW GENERATE IN PARALLEL via a
+    ThreadPoolExecutor (see _generate_all_items), instead of looping
+    section-by-section, item-by-item. Each item is still ONE call at a
+    time internally (small prompt, small response -- that part of the
+    design was already right), but different items' calls now fire
+    concurrently instead of waiting on each other. If the local Ollama
+    instance can't actually interleave requests, this is a no-op; if it
+    can, it's close to a linear speedup with item count.
+  - ATTEMPTS TO USE JSON MODE when talking to Ollama, via a `json_mode=
+    True` kwarg on invoke_with_timeout. This is guarded by a TypeError
+    fallback because core/llm.py's invoke_with_timeout doesn't
+    necessarily support the kwarg yet -- see the comment at the call
+    site for what needs to change in core/llm.py (passing Ollama's
+    `format: "json"` through BridgeChatLLM) for this to actually take
+    effect instead of silently no-op'ing back to prompt-only formatting.
+  - CHAPTER TEXT IS NOW CACHED in-process (see _get_chapter_text_cached)
+    so generating a second paper from the same chapter within the cache
+    TTL skips the vectorstore/read/split round trip entirely.
+  - Added an optional `progress_callback(event: dict)` argument to
+    generate_question_paper(), invoked once per item as it finishes
+    (whether it fully succeeded, partially succeeded, or failed) so a UI
+    layer can render live "MCQ 3/6 done" progress instead of one long
+    blocking wait. Callback is invoked from worker threads -- if the UI
+    layer isn't thread-safe, wrap it in its own lock before passing it
+    in.
   - get_llm() now requires username -- generate_question_paper() passes
     its own `username` argument straight through, since it already had
     it. This is what routes generation through storage_bridge.py's
@@ -57,6 +86,9 @@ CHANGE LOG (this revision):
     instead of a confusing generic failure message.
 """
 import json
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
@@ -114,8 +146,51 @@ MAX_TOTAL_QUESTIONS = 60
 # full count; each subsequent call asks only for whatever's still
 # missing. 3 gives the model two chances to make up a shortfall without
 # letting one stubborn type blow up the total time budget for the paper
-# (worst case: MAX_ITEM_ATTEMPTS calls * ITEM_TIMEOUT_SECONDS per item).
-MAX_ITEM_ATTEMPTS = 1
+# (worst case: MAX_ITEM_ATTEMPTS calls * ITEM_TIMEOUT_SECONDS per item,
+# though with items now running in PARALLEL across a thread pool -- see
+# _generate_all_items -- that worst case hits per-item, not per-paper).
+MAX_ITEM_ATTEMPTS = 3
+
+# Upper bound on concurrent LLM calls in flight at once. A single local
+# Ollama instance often can't truly run more than 1-2 generations at a
+# time anyway (it just queues the rest), but capping this protects
+# against accidentally opening 15+ simultaneous HTTP connections through
+# the ngrok tunnel if someone requests a huge paper.
+MAX_CONCURRENT_ITEM_CALLS = 4
+
+# How long a cached chapter_text stays valid. Chapter content in this
+# app doesn't change on a per-minute basis, so a generous TTL is safe;
+# this just avoids re-hitting the vectorstore/splitter for back-to-back
+# paper generations off the same chapter (e.g. a user tuning counts and
+# regenerating a few times in a row).
+_CHAPTER_TEXT_CACHE_TTL_SECONDS = 30 * 60
+_chapter_text_cache = {}
+_chapter_text_cache_lock = threading.Lock()
+
+
+def _get_chapter_text_cached(username: str, subject: str, chapter: str) -> str:
+    """
+    Thin cache in front of core.vectorstore.get_chapter_text. Keyed on
+    (username, subject, chapter) since chapter text is scoped per-user.
+    Safe to call concurrently -- see MAX_CONCURRENT_ITEM_CALLS -- though
+    in practice this is only ever called once per generate_question_paper
+    call, before the parallel item calls start.
+    """
+    key = (username, subject, chapter)
+    now = time.monotonic()
+    with _chapter_text_cache_lock:
+        cached = _chapter_text_cache.get(key)
+        if cached is not None:
+            text, cached_at = cached
+            if now - cached_at < _CHAPTER_TEXT_CACHE_TTL_SECONDS:
+                return text
+
+    text = get_chapter_text(username, subject, chapter)
+    if text:
+        with _chapter_text_cache_lock:
+            _chapter_text_cache[key] = (text, now)
+    return text
+
 
 def estimate_total_marks(question_counts: dict) -> int:
     """
@@ -353,6 +428,29 @@ def _extract_json(raw: str) -> dict:
         return json.loads(repaired)
 
 
+def _invoke_llm(llm, prompt: str, timeout_seconds: int):
+    """
+    Wraps invoke_with_timeout with an attempt to request Ollama's native
+    JSON mode (format="json"), which makes the model far less likely to
+    wrap its answer in markdown fences or chatty preamble -- the exact
+    failure mode _find_json_object/_extract_json exist to route around.
+
+    core/llm.py's invoke_with_timeout may not support a `json_mode`
+    kwarg yet (it needs to thread `format: "json"` through to the
+    underlying Ollama /api/chat call inside BridgeChatLLM for this to
+    actually do anything). Rather than require that change be made
+    everywhere at once, this call is guarded by a TypeError fallback: if
+    the kwarg isn't accepted, it retries the plain call. Once core/llm.py
+    is updated to accept and forward json_mode, this starts working
+    automatically with no further change here.
+    """
+    try:
+        return invoke_with_timeout(llm, prompt, timeout_seconds=timeout_seconds, json_mode=True)
+    except TypeError:
+        # invoke_with_timeout in core/llm.py doesn't accept json_mode yet.
+        return invoke_with_timeout(llm, prompt, timeout_seconds=timeout_seconds)
+
+
 def _validate_question_extra_clientside(qtype: str, extra: dict) -> bool:
     """
     Mirrors storage_bridge.py's _validate_question_extra -- checked here
@@ -501,7 +599,7 @@ def _generate_item_questions(llm, chapter_text: str, chapter: str, language: str
             chapter_text, chapter, language, item,
             count_override=remaining, avoid_questions=avoid,
         )
-        raw = invoke_with_timeout(llm, prompt, timeout_seconds=timeout_seconds)
+        raw = _invoke_llm(llm, prompt, timeout_seconds=timeout_seconds)
         attempts += 1
         if raw is None:
             continue  # timed out -- try again rather than giving up on the type
@@ -524,6 +622,95 @@ def _generate_item_questions(llm, chapter_text: str, chapter: str, language: str
     return collected, attempts
 
 
+def _generate_all_items(
+    llm, chapter_text: str, chapter: str, language: str,
+    plan: list, timeout_seconds: int, progress_callback=None,
+) -> tuple:
+    """
+    Runs _generate_item_questions for every item across every section of
+    `plan` CONCURRENTLY via a thread pool, instead of the old nested
+    for-section / for-item loop that generated one item at a time from
+    start to finish.
+
+    Each item is still exactly what it was before -- its own small,
+    single-type prompt, its own retry loop -- the only change is that
+    different items' LLM calls are now in flight at the same time rather
+    than strictly sequential. Whether this actually speeds anything up
+    depends on whether the local Ollama instance can interleave
+    generations at all; if it can't, requests simply queue on its side
+    and this degrades gracefully to roughly the old sequential timing
+    (plus a little thread-pool overhead), never worse in a meaningful
+    way.
+
+    `progress_callback`, if given, is called (from a worker thread) once
+    per item as soon as that item finishes, with a dict:
+        {"label": str, "collected": int, "target": int, "attempts": int}
+    so a UI layer can render live progress instead of one long wait for
+    the entire paper.
+
+    Returns (sections_with_questions, failed_item_labels), matching what
+    the old sequential loop produced -- sections_with_questions is a
+    list of {"title", "instructions", "questions": [...]}` dicts in the
+    original section order, and failed_item_labels lists any item that
+    came back empty or short even after retries.
+    """
+    # Flatten (section, item) pairs so every item across the whole paper
+    # competes for the same thread pool, instead of pool-per-section.
+    flat_items = []
+    for section in plan:
+        for item in section["items"]:
+            flat_items.append((section["title"], item))
+
+    results_by_key = {}  # (section_title, item_label) -> (questions, attempts)
+    max_workers = max(1, min(MAX_CONCURRENT_ITEM_CALLS, len(flat_items)))
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        future_to_key = {
+            pool.submit(
+                _generate_item_questions, llm, chapter_text, chapter, language, item, timeout_seconds,
+            ): (section_title, item["label"], item["count"])
+            for section_title, item in flat_items
+        }
+        for future in as_completed(future_to_key):
+            section_title, label, target = future_to_key[future]
+            # Propagate BridgeRequestError/BridgeUnavailableError as-is --
+            # same contract _generate_item_questions already documents,
+            # just surfaced through .result() instead of a direct call.
+            questions, attempts = future.result()
+            results_by_key[(section_title, label)] = questions
+            if progress_callback:
+                try:
+                    progress_callback({
+                        "label": label, "collected": len(questions),
+                        "target": target, "attempts": attempts,
+                    })
+                except Exception:
+                    # A broken progress callback shouldn't take down
+                    # generation itself.
+                    pass
+
+    generated_sections = []
+    failed_item_labels = []
+    for section in plan:
+        section_questions = []
+        for item in section["items"]:
+            questions = results_by_key.get((section["title"], item["label"]), [])
+            if not questions:
+                failed_item_labels.append(item["label"])
+                continue
+            if len(questions) < item["count"]:
+                failed_item_labels.append(f'{item["label"]} ({len(questions)}/{item["count"]})')
+            section_questions.extend(questions)
+        if section_questions:
+            generated_sections.append({
+                "title": section["title"],
+                "instructions": "Answer all questions.",
+                "questions": section_questions,
+            })
+
+    return generated_sections, failed_item_labels
+
+
 def generate_question_paper(
     username: str,
     subject: str,
@@ -531,6 +718,7 @@ def generate_question_paper(
     title: str,
     question_counts: dict = None,
     lang: str = "English",
+    progress_callback=None,
 ) -> dict:
     """
     Generates a question paper for `chapter` and writes it into the bridge
@@ -542,18 +730,26 @@ def generate_question_paper(
      "la": 6, "case_based": 4}. Omitted or falsy counts mean "don't
     include this type." Falls back to DEFAULT_QUESTION_COUNTS if None.
 
+    `progress_callback`, if given, is invoked once per question TYPE as
+    it finishes generating (see _generate_all_items) -- useful for
+    showing live "3/6 MCQs done" progress in the UI instead of one long
+    blocking spinner. Optional; omit for the old fire-and-forget
+    behavior.
+
     Returns {"paper_id": int, "title": str, "subject": str|None,
              "questions_added": int, "questions_skipped": int,
              "estimated_total_marks": int, "failed_sections": list[str]}.
 
-    Generation happens ONE QUESTION TYPE AT A TIME, and each type is
-    generated via _generate_item_questions -- which retries with
-    top-up calls (up to MAX_ITEM_ATTEMPTS) whenever a call returns
-    fewer valid questions than requested, rather than silently accepting
-    a short first response. A type that still falls short after all
-    retries lands in "failed_sections" labelled with how many it
-    actually got (e.g. "case_based (2/4)") instead of just vanishing
-    from the paper with no visible signal.
+    Generation happens ONE QUESTION TYPE AT A TIME per LLM call, but
+    different types now run CONCURRENTLY against each other (see
+    _generate_all_items) -- each type is still generated via
+    _generate_item_questions, which retries with top-up calls (up to
+    MAX_ITEM_ATTEMPTS) whenever a call returns fewer valid questions than
+    requested, rather than silently accepting a short first response. A
+    type that still falls short after all retries lands in
+    "failed_sections" labelled with how many it actually got (e.g.
+    "case_based (2/4)") instead of just vanishing from the paper with no
+    visible signal.
 
     Raises ValueError if question_counts is invalid/empty/too large, the
     chapter text is missing, the LLM is unreachable, or literally every
@@ -575,7 +771,7 @@ def generate_question_paper(
     cleaned_counts = _validate_question_counts(question_counts or DEFAULT_QUESTION_COUNTS)
     plan = _build_section_plan(cleaned_counts)
 
-    chapter_text = get_chapter_text(username, subject, chapter)
+    chapter_text = _get_chapter_text_cached(username, subject, chapter)
     if not chapter_text:
         raise ValueError(f"Chapter text not found for {chapter}.")
 
@@ -584,43 +780,27 @@ def generate_question_paper(
     # "paper" model_type -- see core/llm.py -- is sized (num_predict) for
     # ONE TYPE's worth of questions per call. ITEM_TIMEOUT_SECONDS is per
     # call; with retries this means several small, fast calls per item
-    # instead of one huge one that silently truncates.
+    # instead of one huge one that silently truncates. Kept at 25s (the
+    # low end of the recommended 25-35s window) since items now run in
+    # parallel, so a tighter per-call budget no longer risks starving
+    # later items of time the way it would have in the old sequential
+    # loop.
     ITEM_TIMEOUT_SECONDS = 25
     llm = get_llm(model_type="paper", username=username, request_timeout=ITEM_TIMEOUT_SECONDS)
     if llm is None:
         raise ValueError("Could not connect to the LLM.")
 
-    generated_sections = []  # [{"title", "instructions", "questions": [...]}]
-    failed_item_labels = []
-
-    # BridgeRequestError/BridgeUnavailableError raised anywhere in this
-    # loop (i.e. on the FIRST LLM call for the paper) means the user
-    # isn't allowed to generate a paper at all -- let it propagate
-    # straight out of generate_question_paper() rather than getting
-    # caught by anything below, so the UI shows the bridge's real reason
-    # (e.g. "This feature requires gold tier or higher...") instead of a
+    # BridgeRequestError/BridgeUnavailableError raised anywhere inside
+    # _generate_all_items (i.e. on the FIRST LLM call for the paper)
+    # means the user isn't allowed to generate a paper at all -- let it
+    # propagate straight out of generate_question_paper() rather than
+    # getting caught here, so the UI shows the bridge's real reason (e.g.
+    # "This feature requires gold tier or higher...") instead of a
     # generic "couldn't generate any questions" message.
-    for section in plan:
-        section_questions = []
-        for item in section["items"]:
-            questions, _attempts = _generate_item_questions(
-                llm, context_slice, chapter, lang, item, ITEM_TIMEOUT_SECONDS,
-            )
-            if not questions:
-                failed_item_labels.append(item["label"])
-                continue
-            if len(questions) < item["count"]:
-                # Got SOME, but fewer than asked for even after retries --
-                # still usable, but flag it instead of pretending the
-                # paper has exactly what was requested.
-                failed_item_labels.append(f'{item["label"]} ({len(questions)}/{item["count"]})')
-            section_questions.extend(questions)
-        if section_questions:
-            generated_sections.append({
-                "title": section["title"],
-                "instructions": "Answer all questions.",
-                "questions": section_questions,
-            })
+    generated_sections, failed_item_labels = _generate_all_items(
+        llm, context_slice, chapter, lang, plan, ITEM_TIMEOUT_SECONDS,
+        progress_callback=progress_callback,
+    )
 
     if not generated_sections:
         raise ValueError(
