@@ -12,6 +12,14 @@ ui/auth.py, core/llm.py) should call these functions and not touch
 in one place.
 
 CHANGE LOG (this revision):
+  - Added ollama_embed() -- routes embedding requests through
+    storage_bridge.py's /ollama/embed route instead of calling Ollama
+    directly. Mirrors ollama_chat()/ollama_generate() below, which fixed
+    the same bypass for chat/generate calls. Without this, core/
+    vectorstore.py's OllamaEmbeddings was hitting a path_proxy.py route
+    ("/ollama/api/embed") that no longer exists, since path_proxy.py's
+    direct "/ollama" route was removed on purpose to close the bypass --
+    see path_proxy.py's own change log.
   - Added ollama_chat() / ollama_generate() -- these were previously
     MISSING, which meant core/llm.py was building a ChatOllama client
     pointed straight at OLLAMA_BASE_URL (raw Ollama), completely
@@ -39,13 +47,21 @@ short, tier too low, daily cap hit, etc.). Carries the bridge's own
 distinct from BridgeUnavailableError on purpose — one means "try again
 later, something's down", the other means "this specific thing you
 typed/did was wrong, here's why."
+
+NOTE: this file must NOT import from core.paths, core.vectorstore, or
+anything that itself imports bridge_client -- core/paths.py imports
+bridge_client at module load time, so any reverse import here creates
+a circular import that crashes the app on startup. Keep this file
+purely about HTTP transport to the bridge; file-system/path helpers
+and document-loading logic (get_chapter_text, etc.) belong in
+core/vectorstore.py, not here.
 """
 import requests
 
 from config import BRIDGE_BASE_URL, BRIDGE_SHARED_SECRET
 
 REQUEST_TIMEOUT = 15  # seconds — bridge calls are small JSON/file ops, should be fast
-LLM_REQUEST_TIMEOUT = 300  # seconds — chat/generate calls proxy through to Ollama and can run long
+LLM_REQUEST_TIMEOUT = 300  # seconds — chat/generate/embed calls proxy through to Ollama and can run long
 
 
 class BridgeUnavailableError(Exception):
@@ -248,10 +264,11 @@ def delete_file(username: str, subject: str, filename: str) -> None:
 
 # ---------------------------------------------------------------------
 # AI / LLM proxy (gated by _require_active_subscription + _require_tier
-# on the bridge side -- see storage_bridge.py's /ollama/chat and
-# /ollama/generate routes). ALL LLM calls from the app must go through
-# these two functions, not straight to Ollama, or the tier/subscription
-# system has no effect (this was the root cause of the tier bug).
+# on the bridge side -- see storage_bridge.py's /ollama/chat,
+# /ollama/generate, and /ollama/embed routes). ALL LLM/embedding calls
+# from the app must go through these functions, not straight to Ollama,
+# or the tier/subscription system has no effect (this was the root
+# cause of the tier bug).
 # ---------------------------------------------------------------------
 def ollama_chat(username: str, model: str, messages: list, options: dict = None, format: str = None) -> dict:
     """
@@ -290,6 +307,7 @@ def ollama_generate(username: str, model: str, prompt: str, system: str = None) 
         payload["system"] = system
     return _post("/ollama/generate", json=payload, timeout=LLM_REQUEST_TIMEOUT)
 
+
 def ollama_embed(username: str, model: str, input: list) -> dict:
     """
     input: list of strings to embed.
@@ -309,47 +327,6 @@ def ollama_embed(username: str, model: str, input: list) -> dict:
         timeout=LLM_REQUEST_TIMEOUT,
     )
 
-def get_chapter_text(username: str, subject: str, chapter: str):
-    """
-    Returns the exact, full text of a chapter's source file (txt or pdf),
-    rather than retrieving embedded chunks. Used wherever a feature needs
-    the complete chapter content (e.g. flashcard/quiz generation).
-
-    Fetches the matching file from the bridge into a temp location first,
-    reads it, then cleans up — rather than reading a persistent local
-    "sources" folder that no longer exists.
-    """
-    try:
-        filenames = bridge_client.list_files(username, subject)
-    except BridgeUnavailableError:
-        return None
-
-    safe_chapter = sanitize_filename(chapter).lower()
-    matched_filename = next(
-        (f for f in filenames if safe_chapter in sanitize_filename(f).lower() and f.endswith((".txt", ".pdf"))),
-        None,
-    )
-    if not matched_filename:
-        return None
-
-    try:
-        file_bytes = bridge_client.download_file(username, subject, matched_filename)
-    except BridgeUnavailableError:
-        return None
-
-    temp_dir = tempfile.mkdtemp(prefix="scholarai_chap_")
-    try:
-        local_path = os.path.join(temp_dir, matched_filename)
-        with open(local_path, "wb") as f:
-            f.write(file_bytes)
-
-        if local_path.lower().endswith(".txt"):
-            with open(local_path, "r", encoding="utf-8", errors="replace") as f:
-                return f.read()
-        else:
-            return "\n\n".join(page.page_content for page in PyPDFLoader(local_path).load())
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
 
 def get_usage_today(username: str) -> dict:
     """Returns {"tier": str, "usage": {feature: {"used", "cap", "remaining"}}} --
