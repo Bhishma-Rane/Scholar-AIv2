@@ -4,13 +4,30 @@ core/vectorstore.py
 Per-subject Chroma vector store management, plus raw chapter text retrieval
 (used by features that need the full, exact text rather than embedded chunks).
 
-CHANGED: source PDFs/TXT files no longer live in a persistent local
-folder (paths["subject_source"] no longer exists — see core/paths.py).
-They live on the storage bridge now. Both functions in this file fetch
-the relevant file(s) from the bridge into a TEMPORARY scratch directory
-first, then use the existing PyPDFLoader/TextLoader exactly as before —
-those loader classes need real file paths, so this is the minimal change
-that keeps everything downstream (chunking, embeddings, Chroma) untouched.
+CHANGED (this revision): embeddings now route through storage_bridge.py's
+/ollama/embed route instead of calling Ollama directly via
+langchain_ollama.OllamaEmbeddings. The old direct path
+(OllamaEmbeddings(base_url=OLLAMA_BASE_URL) -> .../ollama/api/embed
+through the tunnel) was a leftover bypass: path_proxy.py's "/ollama"
+route was removed specifically to force all AI calls through the
+bridge's subscription checks (see path_proxy.py's change log), but this
+file was never updated to match -- it kept hitting the now-deleted
+route, which is why get_vector_store(force_rebuild=True) started
+404ing with "No route configured for path: /ollama/api/embed".
+
+BridgeEmbeddings below is the embeddings-side counterpart to
+core/llm.py's BridgeChatLLM, using core/llm.py's embed_texts() (which
+itself calls bridge_client.ollama_embed()) instead of talking to
+Ollama directly.
+
+CHANGED (earlier revision): source PDFs/TXT files no longer live in a
+persistent local folder (paths["subject_source"] no longer exists —
+see core/paths.py). They live on the storage bridge now. Both
+functions in this file fetch the relevant file(s) from the bridge into
+a TEMPORARY scratch directory first, then use the existing
+PyPDFLoader/TextLoader exactly as before — those loader classes need
+real file paths, so this is the minimal change that keeps everything
+downstream (chunking, embeddings, Chroma) untouched.
 
 The temp scratch directory is cleaned up after use. ChromaDB itself
 (paths["chroma"]) is still rebuilt and cached locally on Streamlit
@@ -33,14 +50,40 @@ import tempfile
 
 from chromadb.api.client import SharedSystemClient
 from langchain_community.vectorstores import Chroma
-from langchain_ollama import OllamaEmbeddings
 from langchain_community.document_loaders import TextLoader, PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-from config import OLLAMA_EMBED_MODEL, OLLAMA_BASE_URL
+from config import OLLAMA_EMBED_MODEL
 from core.paths import get_user_paths, sanitize_filename
 from core import bridge_client
 from core.bridge_client import BridgeUnavailableError
+from core.llm import embed_texts
+
+
+class BridgeEmbeddings:
+    """
+    Drop-in replacement for langchain_ollama.OllamaEmbeddings that routes
+    through storage_bridge.py's /ollama/embed route (via
+    core.llm.embed_texts()) instead of calling Ollama directly -- mirrors
+    BridgeChatLLM's fix for chat/generate. Implements the minimal
+    Embeddings interface Chroma needs: embed_documents(list[str]) ->
+    list[list[float]], embed_query(str) -> list[float].
+
+    NOT a LangChain Embeddings subclass -- like BridgeChatLLM, this is a
+    plain object. Chroma only actually calls .embed_documents() and
+    .embed_query(), both of which are implemented here, so it works as
+    a duck-typed embedding_function without inheriting from anything.
+    """
+
+    def __init__(self, model: str, username: str):
+        self.model = model
+        self.username = username
+
+    def embed_documents(self, texts: list) -> list:
+        return embed_texts(username=self.username, texts=texts, model=self.model)
+
+    def embed_query(self, text: str) -> list:
+        return embed_texts(username=self.username, texts=[text], model=self.model)[0]
 
 
 def _clear_local_cache(chroma_db_dir: str):
@@ -86,14 +129,13 @@ def get_vector_store(username: str, subject: str, force_rebuild: bool = False):
 
     Source files are now fetched from the storage bridge into a temp
     directory before being loaded — see _fetch_subject_files_to_temp_dir.
+
+    Embeddings go through BridgeEmbeddings (bridge-routed) rather than
+    OllamaEmbeddings (direct-to-Ollama) -- see module docstring.
     """
     paths = get_user_paths(username, subject)
     chroma_db_dir = paths["chroma"]
-    embeddings = OllamaEmbeddings(
-        model=OLLAMA_EMBED_MODEL,
-        base_url=OLLAMA_BASE_URL,
-        client_kwargs={"headers": {"ngrok-skip-browser-warning": "true"}},
-    )
+    embeddings = BridgeEmbeddings(model=OLLAMA_EMBED_MODEL, username=username)
 
     if force_rebuild:
         _clear_local_cache(chroma_db_dir)
