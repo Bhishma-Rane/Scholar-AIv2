@@ -3,6 +3,18 @@ features/flashcards.py
 ========================
 Spaced-repetition style flashcard deck generation, batched in chunks
 of 5 to keep individual LLM calls fast and reliable.
+
+CHANGE LOG (this revision):
+  - Fixed generate_flashcards() calling get_llm("quiz") with no
+    username, even though `username` is a parameter of this very
+    function. Under get_llm()'s current contract (refuses to return an
+    LLM without a username), this meant every flashcard generation call
+    was failing outright with "Failed: LLM Engine offline." regardless
+    of tier.
+  - Now passes feature="flashcards" explicitly, since flashcards and
+    quiz-question generation share model_type="quiz" (same num_predict
+    budget) but are gated as separate tiers in storage_bridge.py's
+    FEATURE_MIN_TIER ("flashcards" vs "quiz_generation").
 """
 import os
 import re
@@ -54,7 +66,11 @@ def generate_flashcards(username: str, subject: str, chapter: str, count: int, l
     attempts = 0
     max_attempts = (count // BATCH_SIZE) + 10
 
-    quiz_llm = get_llm("quiz")
+    # Was get_llm("quiz") with no username -- username is right here in
+    # scope, it just wasn't being passed. feature="flashcards" gates this
+    # against FEATURE_MIN_TIER["flashcards"] (gold+) instead of the
+    # "quiz_generation" gate that model_type="quiz" would default to.
+    quiz_llm = get_llm("quiz", username=username, feature="flashcards")
     if not quiz_llm:
         return "Failed: LLM Engine offline."
 
@@ -71,6 +87,7 @@ Format MUST be:
   {{"front": "Question or Term", "back": "Answer or Definition", "box": 1}}
 ]"""
             raw_out = quiz_llm.invoke(f"{quiz_inst}\n\nContext:\n{context_slice}").content
+
             try:
                 # Fix Issue #6: Safe regex extraction.
                 match = re.search(r"\[.*\]", raw_out, re.DOTALL)
@@ -90,8 +107,12 @@ Format MUST be:
 
         new_flashcards = new_flashcards[:count]
         combined_deck = existing_cards + new_flashcards
+
         with open(fc_path, "w", encoding="utf-8") as f:
             json.dump(combined_deck, f, indent=4)
+
         return f"Success: added {len(new_flashcards)} new cards (deck now has {len(combined_deck)} total)."
+
     except Exception as e:
         return f"Failed: {str(e)}"
+        
