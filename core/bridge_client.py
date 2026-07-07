@@ -270,7 +270,8 @@ def delete_file(username: str, subject: str, filename: str) -> None:
 # or the tier/subscription system has no effect (this was the root
 # cause of the tier bug).
 # ---------------------------------------------------------------------
-def ollama_chat(username: str, model: str, messages: list, options: dict = None, format: str = None) -> dict:
+def ollama_chat(username: str, model: str, messages: list, options: dict = None,
+                 format: str = None, timeout: float = None) -> dict:
     """
     messages: list of {"role": "user"|"assistant"|"system", "content": str}
     Raises BridgeRequestError(status_code=402) if the account isn't active,
@@ -284,6 +285,17 @@ def ollama_chat(username: str, model: str, messages: list, options: dict = None,
     requests Ollama's native structured-JSON output mode. Both are
     omitted from the request body entirely when not set, so existing
     callers that don't pass them see no change in behavior.
+
+    `timeout`, if given, overrides LLM_REQUEST_TIMEOUT for this call's
+    socket-level timeout. This matters because core.llm.invoke_with_timeout()
+    gives up WAITING on a background thread after its own timeout, but --
+    without this -- the underlying requests.post() the thread is running
+    keeps going for the full LLM_REQUEST_TIMEOUT (300s) regardless,
+    silently occupying a slot against Ollama's single-worker queue long
+    after the caller has moved on and retried. Passing a `timeout` close
+    to the caller's real deadline lets this request actually give up
+    around the same time, instead of running as an orphan for up to 5
+    more minutes.
     """
     payload = {"username": username, "model": model, "messages": messages}
     if options:
@@ -293,7 +305,7 @@ def ollama_chat(username: str, model: str, messages: list, options: dict = None,
     return _post(
         "/ollama/chat",
         json=payload,
-        timeout=LLM_REQUEST_TIMEOUT,
+        timeout=timeout if timeout is not None else LLM_REQUEST_TIMEOUT,
     )
 
 
@@ -470,3 +482,4 @@ def get_tutorial_completed(username: str) -> bool:
 
 def set_tutorial_completed(username: str, completed: bool) -> None:
     _post("/users/tutorial_completed", json={"username": username, "completed": completed})
+  
