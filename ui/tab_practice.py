@@ -224,15 +224,31 @@ def _render_take_quiz_subtab(username: str, active_subject: str, active_chapter:
 def render_practice_tab(username: str, active_subject: str, active_chapter: str, target_language: str):
     st.header("📝 Practice & Exams")
 
-    gen_subtab, quiz_subtab, paper_subtab = st.tabs(
-        ["⚡ Generate Quiz", "✏️ Take Quiz", "📋 Question Paper"]
+    # NOTE: this used to be a second, NESTED st.tabs() inside the outer
+    # st.tabs() in app.py. Streamlit's tab panels are always present in
+    # the DOM (just hidden with CSS) rather than actually unmounted, and
+    # calling st.rerun() from inside an INNER tab -- which both the
+    # Generate Quiz and Question Paper sub-tabs do, to swap in a very
+    # different widget tree (setup form -> success message, or setup
+    # form -> question-taking screen) -- could desync the frontend's
+    # bookkeeping of which panel belongs to which tab bar two levels
+    # deep. Once desynced it stayed broken until a hard refresh, which
+    # is what showed up as "all tabs stacked into one long scrollable
+    # page." A plain st.radio styled as a tab bar sidesteps this
+    # entirely: only the selected branch's content is ever rendered --
+    # there's no hidden-panel DOM for anything to lose track of.
+    sub_choice = st.radio(
+        "Practice & Exams section:",
+        ["⚡ Generate Quiz", "✏️ Take Quiz", "📋 Question Paper"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="practice_sub_choice",
     )
+    st.markdown("---")
 
-    with gen_subtab:
+    if sub_choice == "⚡ Generate Quiz":
         _render_generate_quiz_subtab(username, active_subject, active_chapter, target_language)
-
-    with quiz_subtab:
+    elif sub_choice == "✏️ Take Quiz":
         _render_take_quiz_subtab(username, active_subject, active_chapter, target_language)
-
-    with paper_subtab:
+    else:
         render_question_paper_tab(username, active_subject, active_chapter, target_language)
