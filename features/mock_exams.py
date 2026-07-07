@@ -3,13 +3,45 @@ features/mock_exams.py
 ========================
 Printable mock exam generation (question paper + answer key) and
 AI-assisted grading of subjective answers.
+
+CHANGE LOG (this revision):
+  - grade_subjective_answer(), generate_performance_summary(), and
+    build_mock_exam_paper() were all calling get_llm() / get_llm("quiz")
+    with NO username. Under get_llm()'s current contract (refuses to
+    return an LLM without a username, so tier/subscription enforcement
+    always has someone to check), this meant:
+      - grade_subjective_answer() silently returned "Grading unavailable"
+        for every answer, every time.
+      - generate_performance_summary() had no None-check before calling
+        .invoke() on what get_llm() returned, so it crashed outright
+        with AttributeError.
+      - build_mock_exam_paper() ALSO used LangChain's `prompt | llm |
+        parser` pipe syntax, which BridgeChatLLM does not support (it's
+        a plain shim, not a LangChain Runnable -- see core/llm.py's
+        docstring). This raised a TypeError as soon as the chain was
+        built, independent of the username bug -- this function could
+        not run at all before this fix.
+  - All three now take/forward a `username` parameter and gate correctly:
+    grading calls use the default "ai_chat" feature (grading an already-
+    permitted quiz/paper attempt shouldn't itself be tier-blocked), and
+    build_mock_exam_paper's generation calls use feature="question_paper"
+    (diamond-tier only, matching FEATURE_MIN_TIER).
+  - build_mock_exam_paper() no longer uses ChatPromptTemplate/pipe syntax
+    -- prompts are now built as plain strings and sent via
+    quiz_llm.invoke(prompt).content, the same pattern used elsewhere in
+    this codebase (features/flashcards.py, features/chat_graph.py).
+
+IMPORTANT -- CALL SITES OUTSIDE THIS FILE: wherever grade_full_quiz() and
+generate_performance_summary() are called from (likely a UI file handling
+quiz/paper results), those call sites now need to pass username=... too,
+the same way features/flashcards.py's caller already does. Grep for
+`grade_full_quiz(` and `generate_performance_summary(` in your ui/
+directory and add the username argument at each call site.
 """
 import re
 import json
 from typing import List
 
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from core.llm import get_llm
@@ -21,7 +53,6 @@ def grade_objective_answer(question: dict, user_answer) -> dict:
     """
     Grades a single objective (MCQ) question. Pure string comparison — no
     LLM call needed since the correct option letter is already known.
-
     Returns {"is_correct": bool, "marks_earned": float, "marks_possible": float}.
     """
     marks_possible = question.get("marks", 1)
@@ -30,8 +61,8 @@ def grade_objective_answer(question: dict, user_answer) -> dict:
 
     # Accept either "A" or "A) opt1" style answers/options.
     given_letter = given_answer.split(")")[0].strip() if ")" in given_answer else given_answer
-
     is_correct = given_letter == correct_answer
+
     return {
         "is_correct": is_correct,
         "marks_earned": marks_possible if is_correct else 0,
@@ -39,7 +70,7 @@ def grade_objective_answer(question: dict, user_answer) -> dict:
     }
 
 
-def grade_subjective_answer(question: dict, user_answer: str, lang: str = "English") -> dict:
+def grade_subjective_answer(question: dict, user_answer: str, lang: str = "English", username: str = None) -> dict:
     """
     Grades a single short/long-answer question by asking the LLM to compare
     the student's answer against the official answer key, allowing partial
@@ -63,6 +94,7 @@ def grade_subjective_answer(question: dict, user_answer: str, lang: str = "Engli
         }
 
     grading_prompt = f"""You are a strict but fair exam grader. Respond in {lang}.
+
 Question: {question.get('q', '')}
 Official Answer Key: {question.get('answer', '')}
 Student's Answer: {user_answer}
@@ -76,8 +108,14 @@ get partial marks, not zero. A fully blank or completely wrong answer gets 0.
 RETURN STRICTLY AS JSON, NOTHING ELSE:
 {{"marks_earned": <number between 0 and {marks_possible}, can be a decimal>, "feedback": "<one sentence>"}}
 """
+
     try:
-        llm = get_llm()
+        # Was get_llm() with no username -- username is now threaded in
+        # from grade_full_quiz(), which callers must pass. Default
+        # model_type="main" maps to feature="ai_chat", which is correct
+        # here: grading an answer to a quiz/paper the student was already
+        # allowed to attempt shouldn't itself be gated behind a higher tier.
+        llm = get_llm(username=username)
         if not llm:
             return {
                 "is_correct": False,
@@ -111,7 +149,8 @@ RETURN STRICTLY AS JSON, NOTHING ELSE:
         }
 
 
-def grade_full_quiz(quiz_data: list, user_answers: dict, negative_marking: bool, lang: str = "English") -> dict:
+def grade_full_quiz(quiz_data: list, user_answers: dict, negative_marking: bool,
+                     lang: str = "English", username: str = None) -> dict:
     """
     Grades an entire quiz attempt question-by-question.
 
@@ -122,16 +161,19 @@ def grade_full_quiz(quiz_data: list, user_answers: dict, negative_marking: bool,
         of that question's marks). Negative marking is never applied to
         subjective answers or to skipped/blank questions, only to answers
         that were actually attempted and wrong.
+    username: forwarded to grade_subjective_answer() for every subjective
+        question in this quiz -- REQUIRED if the quiz contains any
+        subjective questions, or grading will report "LLM engine offline"
+        for each one.
 
     Returns:
-    {
-      "total_score": float, "max_score": float,
-      "per_question": [ {index, is_correct, marks_earned, marks_possible, feedback}, ... ],
-      "topic_breakdown": {topic: {"correct": float, "total": float}}
-    }
+        {
+            "total_score": float, "max_score": float,
+            "per_question": [ {index, is_correct, marks_earned, marks_possible, feedback}, ... ],
+            "topic_breakdown": {topic: {"correct": float, "total": float}}
+        }
     """
     NEGATIVE_MARK_FRACTION = 0.25
-
     per_question = []
     total_score = 0.0
     max_score = 0.0
@@ -149,7 +191,7 @@ def grade_full_quiz(quiz_data: list, user_answers: dict, negative_marking: bool,
                 result["marks_earned"] = -round(marks_possible * NEGATIVE_MARK_FRACTION, 2)
             result["feedback"] = "" if result["is_correct"] else f"Correct answer: {question.get('answer', '')}"
         else:
-            result = grade_subjective_answer(question, user_answer, lang)
+            result = grade_subjective_answer(question, user_answer, lang, username=username)
 
         result["index"] = idx
         per_question.append(result)
@@ -193,86 +235,90 @@ def build_mock_exam_paper(username: str, subject: str, chapter: str, config: dic
     a_paper = f"MASTER ANSWER KEY: {chapter.upper()}\n\n"
     strict_rule = "\nCRITICAL RULE: Output ONLY the requested questions. NO conversational text."
 
-    quiz_llm = get_llm("quiz")
+    # Was get_llm("quiz") with no username, and results were built via
+    # LangChain's `prompt | quiz_llm | StrOutputParser()` pipe syntax --
+    # BridgeChatLLM is a plain shim, NOT a LangChain Runnable, so that
+    # pipe composition raised a TypeError as soon as it was built. This
+    # is gated as feature="question_paper" (diamond-tier only), matching
+    # FEATURE_MIN_TIER, since this generates a full mock exam paper, the
+    # same category as the interactive question-paper generator.
+    quiz_llm = get_llm("quiz", username=username, feature="question_paper")
+    if not quiz_llm:
+        raise RuntimeError("LLM engine offline -- cannot build mock exam paper.")
 
     for section in config["order"]:
         if section == "MCQs" and config["mcq_count"] > 0:
             q_paper += "=== SECTION: MULTIPLE CHOICE ===\n\n"
             a_paper += "=== SECTION: MULTIPLE CHOICE ===\n\n"
-            q_out = (
-                ChatPromptTemplate.from_messages(
-                    [
-                        ("system", f"Generate EXACTLY {config['mcq_count']} Multiple Choice Questions." + strict_rule),
-                        ("human", f"Context:\n{context_slice}"),
-                    ]
-                )
-                | quiz_llm
-                | StrOutputParser()
-            ).invoke({})
+
+            q_prompt = (
+                f"Generate EXACTLY {config['mcq_count']} Multiple Choice Questions.{strict_rule}\n\n"
+                f"Context:\n{context_slice}"
+            )
+            q_out = quiz_llm.invoke(q_prompt).content
             q_paper += q_out + "\n\n"
-            a_paper += (
-                ChatPromptTemplate.from_messages(
-                    [
-                        ("system", "Provide only the answer key list."),
-                        ("human", f"Questions:\n{q_out}\nContext:\n{context_slice}"),
-                    ]
-                )
-                | quiz_llm
-                | StrOutputParser()
-            ).invoke({}) + "\n\n"
+
+            a_prompt = (
+                "Provide only the answer key list.\n\n"
+                f"Questions:\n{q_out}\nContext:\n{context_slice}"
+            )
+            a_paper += quiz_llm.invoke(a_prompt).content + "\n\n"
 
         elif section == "Short Answer" and config["short_count"] > 0:
             q_paper += "=== SECTION: SHORT ANSWER ===\n\n"
             a_paper += "=== SECTION: SHORT ANSWER ===\n\n"
-            q_out = (
-                ChatPromptTemplate.from_messages(
-                    [
-                        ("system", f"Generate EXACTLY {config['short_count']} Short Answer Questions." + strict_rule),
-                        ("human", f"Context:\n{context_slice}"),
-                    ]
-                )
-                | quiz_llm
-                | StrOutputParser()
-            ).invoke({})
+
+            q_prompt = (
+                f"Generate EXACTLY {config['short_count']} Short Answer Questions.{strict_rule}\n\n"
+                f"Context:\n{context_slice}"
+            )
+            q_out = quiz_llm.invoke(q_prompt).content
             q_paper += q_out + "\n\n"
-            a_paper += (
-                ChatPromptTemplate.from_messages(
-                    [
-                        ("system", "Provide short answers."),
-                        ("human", f"Questions:\n{q_out}\nContext:\n{context_slice}"),
-                    ]
-                )
-                | quiz_llm
-                | StrOutputParser()
-            ).invoke({}) + "\n\n"
+
+            a_prompt = (
+                "Provide short answers.\n\n"
+                f"Questions:\n{q_out}\nContext:\n{context_slice}"
+            )
+            a_paper += quiz_llm.invoke(a_prompt).content + "\n\n"
 
     with open(f"{paths['mock']}/{chapter}_MockExam_Questions.txt", "w", encoding="utf-8") as f:
         f.write(q_paper)
+
     with open(f"{paths['mock']}/{chapter}_MockExam_Answers.txt", "w", encoding="utf-8") as f:
         f.write(a_paper)
 
 
-def generate_performance_summary(wrong_answers: List[dict], subjective_answers: List[dict], lang: str) -> dict:
+def generate_performance_summary(wrong_answers: List[dict], subjective_answers: List[dict],
+                                  lang: str, username: str = None) -> dict:
     """
     Sends subjective answers to the LLM for strict grading + brief feedback.
     Returns {"subjective_score": int, "ai_feedback": str}.
     """
     analysis_prompt = f"You are an elite academic grader. Analyze the exam performance in {lang}.\n\n"
+
     if subjective_answers:
         for item in subjective_answers:
             analysis_prompt += f"Q: {item['q']}\nStudent Wrote: {item['written']}\nOfficial Key: {item['actual']}\n\n"
+
     analysis_prompt += """TASK:
-    1. Grade each subjective answer strictly (1 point if conceptually correct, 0 if wrong/blank).
-    2. Provide brief feedback on the current test attempt.
-    RETURN YOUR OUTPUT STRICTLY AS JSON: {"subjective_score": <int>, "ai_feedback": "<string>"}
-    """
+1. Grade each subjective answer strictly (1 point if conceptually correct, 0 if wrong/blank).
+2. Provide brief feedback on the current test attempt.
+
+RETURN YOUR OUTPUT STRICTLY AS JSON: {"subjective_score": <int>, "ai_feedback": "<string>"}
+"""
+
     try:
-        llm = get_llm()
+        # Was get_llm() with no username AND no None-check before .invoke() --
+        # this crashed outright (AttributeError) as soon as it ran.
+        llm = get_llm(username=username)
+        if not llm:
+            return {"subjective_score": 0, "ai_feedback": "Grading unavailable: LLM engine offline."}
+
         res = llm.invoke(analysis_prompt).content
-        # Fix Issue #7: Safe regex.
         match = re.search(r"\{.*\}", res, re.DOTALL)
         if match:
             return json.loads(match.group())
         return {"subjective_score": 0, "ai_feedback": "Unable to parse AI grading format."}
     except Exception as e:
         return {"subjective_score": 0, "ai_feedback": f"Error grading subjective questions: {str(e)}"}
+        
