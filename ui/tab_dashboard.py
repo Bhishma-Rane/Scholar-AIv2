@@ -6,9 +6,11 @@ what needs work, recommended next steps, and overall momentum — built
 from real analytics data (core.analytics_store via features.dashboard_ai),
 not invented by the LLM from nothing.
 """
-import streamlit as st
 
+import streamlit as st
 from features.dashboard_ai import generate_dashboard_summary
+
+DASHBOARD_CACHE_KEY = "dashboard_cache_v2"
 
 
 def render_dashboard_tab(username: str, active_subject: str, target_language: str):
@@ -19,16 +21,17 @@ def render_dashboard_tab(username: str, active_subject: str, target_language: st
     st.markdown(f"**Scope:** {scope_label}")
 
     if st.button("🔄 Refresh My Progress Report", type="primary"):
-        st.session_state.pop("dashboard_cache", None)
+        st.session_state.pop(DASHBOARD_CACHE_KEY, None)
 
-    if "dashboard_cache" not in st.session_state:
+    if DASHBOARD_CACHE_KEY not in st.session_state:
         with st.spinner("Reviewing your study history..."):
             subject_filter = active_subject if active_subject and active_subject != "Select Subject" else None
-            st.session_state.dashboard_cache = generate_dashboard_summary(
+            st.session_state[DASHBOARD_CACHE_KEY] = generate_dashboard_summary(
                 username, subject=subject_filter, language=target_language
             )
 
-    result = st.session_state.dashboard_cache
+    result = st.session_state[DASHBOARD_CACHE_KEY]
+
     if isinstance(result, dict):
         summary = result.get("summary_markdown", "⚠️ 'summary_markdown' key not found in result.")
         st.markdown(summary)
@@ -37,8 +40,8 @@ def render_dashboard_tab(username: str, active_subject: str, target_language: st
             with st.expander("📋 View raw underlying data"):
                 st.json(result.get("raw_data"))
         else:
-            st.session_state.pop("dashboard_cache", None)
+            st.session_state.pop(DASHBOARD_CACHE_KEY, None)
     else:
         st.error("Error: Expected 'result' to be a dictionary.")
         st.write("Actual result content:", result)
-        st.session_state.pop("dashboard_cache", None)
+        st.session_state.pop(DASHBOARD_CACHE_KEY, None)
