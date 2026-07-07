@@ -4,12 +4,27 @@ core/llm.py
 Lazy-loaded LLM access and the shared internet/image search tools.
 
 CHANGE LOG (this revision):
+  - BridgeChatLLM and get_llm() now carry a `feature` string end-to-end
+    and send it to bridge_client.ollama_chat() on every call, which
+    forwards it to storage_bridge.py's /ollama/chat route as
+    req.feature. Previously `model_type` ("main"/"quiz"/"paper") only
+    ever affected num_predict -- it was NEVER turned into a feature name
+    on the wire, so the bridge's /ollama/chat route had no way to tell
+    "this is a chat message" apart from "this is quiz/flashcard/paper
+    generation" and gated every single call as "ai_chat". That's why
+    FEATURE_MIN_TIER's "quiz_generation": "gold" and "flashcards": "gold"
+    entries were dead config -- this fixes that.
+  - get_llm() gained an explicit `feature` override parameter, separate
+    from model_type. This matters because features/flashcards.py calls
+    get_llm("quiz", ...) (same model_type as real quiz-question
+    generation, since both want the same num_predict budget) but needs
+    to be gated as "flashcards", not "quiz_generation" -- pass
+    feature="flashcards" explicitly at that call site.
   - Added embed_texts() -- the embeddings-side counterpart to
     BridgeChatLLM. Routes embedding requests through
     storage_bridge.py's /ollama/embed route (via
     bridge_client.ollama_embed()) instead of calling Ollama directly.
     Used by core/vectorstore.py's BridgeEmbeddings.
-
   - BridgeChatLLM now ACTUALLY ATTEMPTS to forward `num_predict` (as an
     `options={"num_predict": ...}` kwarg) and JSON mode (as a `format=
     "json"` kwarg) to bridge_client.ollama_chat(). Previously num_predict
@@ -21,14 +36,12 @@ CHANGE LOG (this revision):
     That's a very plausible contributor to the "model truncates output
     early" symptom, independent of anything in
     features/question_paper_generator.py's retry logic.
-
   - THIS ONLY TAKES EFFECT IF bridge_client.ollama_chat() AND
     storage_bridge.py's /ollama/chat ROUTE ARE ALSO UPDATED to accept
-    and forward `options` and `format`. Both have since been updated
-    (see bridge_client.py and storage_bridge.py) -- the TypeError
-    fallback below is now dead code for that reason, but left in place
-    as a safety net in case those two files ever regress.
-
+    and forward `options`, `format`, and now `feature`. All three have
+    since been updated (see bridge_client.py and storage_bridge.py) --
+    the TypeError fallback below is now dead code for that reason, but
+    left in place as a safety net in case those files ever regress.
   - invoke(), invoke_messages(), and invoke_with_timeout() all gained an
     optional `json_mode: bool = False` parameter that threads down to
     the same format="json" attempt, for callers (like
@@ -50,13 +63,14 @@ PREVIOUS REVISION'S CHANGE LOG (why BridgeChatLLM exists at all):
 
   This revision replaces ChatOllama with BridgeChatLLM, a minimal shim
   with two entry points:
-    - .invoke(prompt: str)          -- single flat string prompt, used by
-                                        features/question_paper_generator.py
-                                        and the quiz chunk generator.
-    - .invoke_messages(messages)    -- a list of {"role", "content"} dicts
-                                        (or LangChain BaseMessage objects),
-                                        used by features/chat_graph.py so
-                                        multi-turn chat_history is preserved.
+    - .invoke(prompt: str) -- single flat string prompt, used by
+      features/question_paper_generator.py
+      and the quiz chunk generator.
+    - .invoke_messages(messages) -- a list of {"role", "content"} dicts
+      (or LangChain BaseMessage objects),
+      used by features/chat_graph.py so
+      multi-turn chat_history is preserved.
+
   Both internally call bridge_client.ollama_chat(), which enforces
   tier/subscription on the bridge side before proxying to Ollama.
 
@@ -75,6 +89,7 @@ PREVIOUS REVISION'S CHANGE LOG (why BridgeChatLLM exists at all):
 """
 import threading
 from typing import Optional, Union
+
 from langchain_community.tools import DuckDuckGoSearchRun
 from ddgs import DDGS
 
@@ -92,12 +107,23 @@ internet_search = DuckDuckGoSearchRun()
 # question paper generating 8+ items in parallel.
 _warned_bridge_missing_kwargs = False
 
+# Maps get_llm()'s model_type to the FEATURE_MIN_TIER/DAILY_CAPS key it
+# should be gated as on the bridge, when the caller doesn't pass an
+# explicit `feature=` override. Keep this in sync with
+# storage_bridge.py's FEATURE_MIN_TIER dict.
+_MODEL_TYPE_TO_FEATURE = {
+    "main": "ai_chat",
+    "quiz": "quiz_generation",
+    "paper": "question_paper",
+}
+
 
 def search_images(query: str, max_results: int = 4) -> list:
     """
     Free, no-API-key image search via DuckDuckGo. Used for "VISUAL" diagram
     requests (e.g. "the human heart") where a real labeled image is needed
     rather than a Mermaid diagram.
+
     Returns a list of {"title": str, "image_url": str, "source_url": str}.
     Returns an empty list on any failure rather than raising, since this
     is a best-effort enhancement, not a critical path.
@@ -137,7 +163,6 @@ def _normalize_message(msg) -> dict:
     """
     if isinstance(msg, dict):
         return {"role": msg["role"], "content": msg["content"]}
-
     # LangChain BaseMessage subclasses expose .type ("human"/"ai"/"system")
     # and .content.
     role_map = {"human": "user", "ai": "assistant", "system": "system"}
@@ -166,11 +191,15 @@ class BridgeChatLLM:
     """
 
     def __init__(self, model: str, username: str, system: Optional[str] = None,
-                 num_predict: Optional[int] = None):
+                 num_predict: Optional[int] = None, feature: str = "ai_chat"):
         self.model = model
         self.username = username
         self.system = system
         self.num_predict = num_predict
+        # Which FEATURE_MIN_TIER/DAILY_CAPS key this instance's calls
+        # should be gated as on the bridge -- see get_llm() below for how
+        # this gets set. Always sent, so the bridge never has to guess.
+        self.feature = feature
 
     def invoke(self, prompt: str, json_mode: bool = False, timeout: float = None) -> _LLMResponse:
         """Single flat-string prompt -- optionally prefixed with self.system
@@ -198,8 +227,7 @@ class BridgeChatLLM:
 
     def _invoke_messages_raw(self, messages: list, json_mode: bool = False, timeout: float = None) -> _LLMResponse:
         global _warned_bridge_missing_kwargs
-
-        kwargs = {}
+        kwargs = {"feature": self.feature}
         if self.num_predict:
             kwargs["options"] = {"num_predict": self.num_predict}
         if json_mode:
@@ -217,8 +245,8 @@ class BridgeChatLLM:
         except TypeError:
             if kwargs and not _warned_bridge_missing_kwargs:
                 print(
-                    "[ScholarAI] bridge_client.ollama_chat() doesn't accept options/format/timeout "
-                    "yet -- num_predict, json_mode, and timeout are being silently ignored until "
+                    "[ScholarAI] bridge_client.ollama_chat() doesn't accept options/format/timeout/feature "
+                    "yet -- num_predict, json_mode, timeout, and feature are being silently ignored until "
                     "bridge_client.py and storage_bridge.py's /ollama/chat route are updated "
                     "to forward them."
                 )
@@ -293,7 +321,7 @@ def invoke_with_timeout(
         try:
             text = invoke_with_timeout(llm, prompt)
         except BridgeRequestError as e:
-            show_user_facing_message(e.detail)   # e.g. "Daily limit reached..."
+            show_user_facing_message(e.detail)  # e.g. "Daily limit reached..."
         except BridgeUnavailableError as e:
             show_user_facing_message(str(e))
     """
@@ -332,7 +360,8 @@ def invoke_with_timeout(
     return result["content"]
 
 
-def get_llm(model_type: str = "main", username: str = None, system: str = None, request_timeout: float = 60.0):
+def get_llm(model_type: str = "main", username: str = None, system: str = None,
+            request_timeout: float = 60.0, feature: Optional[str] = None):
     """
     Get a BridgeChatLLM instance configured for the specified task.
     ALL inference now goes through storage_bridge.py's /ollama/chat route,
@@ -341,6 +370,8 @@ def get_llm(model_type: str = "main", username: str = None, system: str = None, 
     Args:
         model_type: "main" for standard inference, "quiz" for quiz generation,
             "paper" for question-paper generation (one question type per call).
+            Also used to derive num_predict AND (via _MODEL_TYPE_TO_FEATURE)
+            the default feature gate, unless `feature` overrides it.
         username: REQUIRED. The bridge's tier/subscription gate is keyed on
             this. Every existing call site that previously did
             `get_llm("quiz")` etc. now needs `get_llm("quiz", username=username)`.
@@ -350,6 +381,15 @@ def get_llm(model_type: str = "main", username: str = None, system: str = None, 
             its own upstream timeout) -- kept as a parameter for call-site
             compatibility with older code; pass the same value through to
             invoke_with_timeout()'s timeout_seconds instead.
+        feature: explicit override for which FEATURE_MIN_TIER/DAILY_CAPS key
+            this LLM's calls should be gated as (e.g. "ai_chat",
+            "quiz_generation", "flashcards", "question_paper"). Use this
+            whenever model_type's default mapping doesn't match what the
+            call actually is -- e.g. features/flashcards.py calls
+            get_llm("quiz", username=username, feature="flashcards")
+            because it wants "quiz" model_type's num_predict budget but
+            needs to be gated as "flashcards", not "quiz_generation".
+            If omitted, defaults from model_type via _MODEL_TYPE_TO_FEATURE.
 
     Returns:
         BridgeChatLLM instance, or None if username is missing (fails
@@ -361,14 +401,16 @@ def get_llm(model_type: str = "main", username: str = None, system: str = None, 
               "bridge's tier/subscription check. Every call site must now pass username=.")
         return None
 
+    resolved_feature = feature or _MODEL_TYPE_TO_FEATURE.get(model_type, "ai_chat")
+
     try:
         num_predict = None
         if model_type == "quiz":
             num_predict = 1024
         elif model_type == "paper":
             num_predict = 3072
-
-        return BridgeChatLLM(model=OLLAMA_MAIN_MODEL, username=username, system=system, num_predict=num_predict)
+        return BridgeChatLLM(model=OLLAMA_MAIN_MODEL, username=username, system=system,
+                              num_predict=num_predict, feature=resolved_feature)
     except Exception as e:
         print(f"[ScholarAI] Error setting up bridge-routed LLM: {e}")
         return None
