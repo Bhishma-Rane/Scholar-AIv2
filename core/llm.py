@@ -172,27 +172,31 @@ class BridgeChatLLM:
         self.system = system
         self.num_predict = num_predict
 
-    def invoke(self, prompt: str, json_mode: bool = False) -> _LLMResponse:
+    def invoke(self, prompt: str, json_mode: bool = False, timeout: float = None) -> _LLMResponse:
         """Single flat-string prompt -- optionally prefixed with self.system
         as a system message. Use this for one-shot generation (quiz/paper
         question generation) where there's no multi-turn history to carry.
 
         `json_mode`, if True, attempts to request Ollama's native JSON
-        output mode -- see _invoke_messages_raw."""
+        output mode -- see _invoke_messages_raw.
+
+        `timeout`, if given, is passed down to bridge_client.ollama_chat()
+        as its socket-level timeout -- see invoke_with_timeout() for why
+        this matters."""
         messages = []
         if self.system:
             messages.append({"role": "system", "content": self.system})
         messages.append({"role": "user", "content": prompt})
-        return self._invoke_messages_raw(messages, json_mode=json_mode)
+        return self._invoke_messages_raw(messages, json_mode=json_mode, timeout=timeout)
 
-    def invoke_messages(self, messages: list, json_mode: bool = False) -> _LLMResponse:
+    def invoke_messages(self, messages: list, json_mode: bool = False, timeout: float = None) -> _LLMResponse:
         """Full message list -- e.g. [system, *chat_history, latest human turn].
         Use this instead of LangChain's `prompt | llm` piping to preserve
         multi-turn context."""
         normalized = [_normalize_message(m) for m in messages]
-        return self._invoke_messages_raw(normalized, json_mode=json_mode)
+        return self._invoke_messages_raw(normalized, json_mode=json_mode, timeout=timeout)
 
-    def _invoke_messages_raw(self, messages: list, json_mode: bool = False) -> _LLMResponse:
+    def _invoke_messages_raw(self, messages: list, json_mode: bool = False, timeout: float = None) -> _LLMResponse:
         global _warned_bridge_missing_kwargs
 
         kwargs = {}
@@ -200,6 +204,8 @@ class BridgeChatLLM:
             kwargs["options"] = {"num_predict": self.num_predict}
         if json_mode:
             kwargs["format"] = "json"
+        if timeout is not None:
+            kwargs["timeout"] = timeout
 
         try:
             result = bridge_client.ollama_chat(
@@ -211,8 +217,8 @@ class BridgeChatLLM:
         except TypeError:
             if kwargs and not _warned_bridge_missing_kwargs:
                 print(
-                    "[ScholarAI] bridge_client.ollama_chat() doesn't accept options/format yet "
-                    "-- num_predict and json_mode are being silently ignored until "
+                    "[ScholarAI] bridge_client.ollama_chat() doesn't accept options/format/timeout "
+                    "yet -- num_predict, json_mode, and timeout are being silently ignored until "
                     "bridge_client.py and storage_bridge.py's /ollama/chat route are updated "
                     "to forward them."
                 )
@@ -264,11 +270,17 @@ def invoke_with_timeout(
     Call BridgeChatLLM.invoke() (if `prompt` is a string) or
     .invoke_messages() (if `prompt` is a list of messages) with a timeout.
 
-    NOTE: the timeout here is a client-side thread-join safety net only
-    (a bare thread.join() can't forcibly kill a stuck thread, it just
-    stops waiting for it). The bridge's own HTTP call to Ollama has its
-    own timeout (LLM_REQUEST_TIMEOUT in bridge_client.py, currently 300s)
-    which is the one that actually aborts the upstream connection.
+    NOTE: thread.join() can't forcibly kill a stuck thread -- it just
+    stops WAITING for it. Previously the underlying HTTP call still ran
+    for bridge_client.py's full LLM_REQUEST_TIMEOUT (300s) in the
+    background after this function gave up and returned None, silently
+    occupying a slot in Ollama's (single-worker) queue as an orphan the
+    caller had already written off -- and if the caller then retried,
+    the retry piled a second call on top of that same queue, compounding
+    the problem. To avoid that, we now pass `timeout_seconds` down to
+    BridgeChatLLM so the HTTP request itself gives up at roughly the
+    same time this function does, instead of running up to 5 minutes
+    longer than the caller thinks it will.
 
     Returns the response content, or None on timeout/generic error.
 
@@ -287,12 +299,18 @@ def invoke_with_timeout(
     """
     result = {"content": None, "error": None}
 
+    # Give the HTTP call itself a bound close to timeout_seconds (plus a
+    # small cushion for network/bridge overhead) so it doesn't keep
+    # running as an orphan for bridge_client's full 300s default after
+    # this function has already given up on it.
+    http_timeout = timeout_seconds + 10
+
     def invoke_thread():
         try:
             if isinstance(prompt, list):
-                response = llm.invoke_messages(prompt, json_mode=json_mode)
+                response = llm.invoke_messages(prompt, json_mode=json_mode, timeout=http_timeout)
             else:
-                response = llm.invoke(prompt, json_mode=json_mode)
+                response = llm.invoke(prompt, json_mode=json_mode, timeout=http_timeout)
             result["content"] = response.content
         except Exception as e:
             result["error"] = e
