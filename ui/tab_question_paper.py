@@ -23,6 +23,8 @@ to the username that generated it and shows up in their own list the
 moment it's created -- nothing to approve, nothing shared between
 students by default.
 """
+import threading
+
 import streamlit as st
 
 from features.question_paper_generator import (
@@ -133,35 +135,100 @@ def _render_generate_form(username: str, active_subject: str, active_chapter: st
                 f"paper for the rest."
             )
 
-        if st.button("🚀 Generate Paper", type="primary", key="qp_gen_button"):
+        gen_state = st.session_state.setdefault("qp_gen_state", {"thread": None, "progress": {}, "lock": threading.Lock()})
+
+        if st.button("🚀 Generate Paper", type="primary", key="qp_gen_button", disabled=gen_state["thread"] is not None):
             if total_questions == 0:
                 st.error("Pick at least one question of some type before generating.")
                 return
 
-            with st.spinner("Building your question paper... this can take a minute."):
+            gen_state["progress"] = {}
+            gen_state["result"] = None
+            gen_state["error"] = None
+
+            def _progress_callback(event):
+                # Called from a worker thread inside generate_question_paper --
+                # only ever touches the shared dict under its own lock, never
+                # calls into Streamlit directly (that's not thread-safe).
+                with gen_state["lock"]:
+                    gen_state["progress"][event["label"]] = event
+
+            def _run():
                 try:
-                    result = generate_question_paper(
+                    gen_state["result"] = generate_question_paper(
                         username=username,
                         subject=active_subject,
                         chapter=active_chapter,
                         title=title,
                         question_counts=question_counts,
                         lang=target_language,
+                        progress_callback=_progress_callback,
                     )
-                except ValueError as e:
-                    st.error(f"Couldn't generate this paper: {e}")
-                    return
-                except BridgeRequestError as e:
-                    st.error(f"Couldn't generate this paper: {e.detail}")
-                    return
-                except BridgeUnavailableError:
-                    st.error("Can't reach the account server right now. Please try again in a moment.")
-                    return
+                except (ValueError, BridgeRequestError, BridgeUnavailableError) as e:
+                    gen_state["error"] = e
+                finally:
+                    gen_state["thread"] = None
 
-            st.success(f"Generated \"{result['title']}\"! Pick it from the list below to start.")
-            if result["questions_skipped"]:
-                st.caption(f"({result['questions_added']} questions added, {result['questions_skipped']} skipped for not matching the expected format.)")
+            thread = threading.Thread(target=_run, daemon=True)
+            gen_state["thread"] = thread
+            thread.start()
             st.rerun()
+
+        if gen_state["thread"] is not None or gen_state.get("result") or gen_state.get("error"):
+            _render_generation_progress(gen_state)
+
+
+@st.fragment(run_every=1)
+def _render_generation_progress(gen_state: dict):
+    """
+    Polls the background generation thread's shared progress dict once a
+    second, INSIDE an st.fragment -- so only this small chunk of the page
+    reruns on each tick, not the whole script (and, critically, not the
+    main st.tabs() call in app.py/tab_practice.py). The old version called
+    generate_question_paper() directly inside a blocking st.spinner, which
+    held the ENTIRE script thread hostage for up to a couple of minutes
+    (MAX_ITEM_ATTEMPTS x ITEM_TIMEOUT_SECONDS across retried items) with no
+    fragment boundary to contain it -- a long enough uninterrupted block,
+    especially over the ngrok tunnel, for the browser's Streamlit
+    WebSocket session to hiccup mid-request. On reconnect after a hiccup
+    like that, the frontend can lose track of which stTabs panel should be
+    hidden and fall back to rendering every tab's content stacked in one
+    long scrollable column. Keeping the wait inside a fragment means the
+    rest of the page (including the tabs) never sits in that frozen state
+    to begin with.
+    """
+    with gen_state["lock"]:
+        progress_snapshot = dict(gen_state["progress"])
+
+    if gen_state["thread"] is not None:
+        if progress_snapshot:
+            for label, event in progress_snapshot.items():
+                st.progress(
+                    min(1.0, event["collected"] / max(1, event["target"])),
+                    text=f"{label}: {event['collected']}/{event['target']}",
+                )
+        else:
+            st.caption("Starting generation…")
+        return
+
+    error = gen_state.get("error")
+    if error is not None:
+        if isinstance(error, ValueError):
+            st.error(f"Couldn't generate this paper: {error}")
+        elif isinstance(error, BridgeRequestError):
+            st.error(f"Couldn't generate this paper: {error.detail}")
+        else:
+            st.error("Can't reach the account server right now. Please try again in a moment.")
+        gen_state["error"] = None
+        return
+
+    result = gen_state.get("result")
+    if result:
+        st.success(f"Generated \"{result['title']}\"! Pick it from the list below to start.")
+        if result["questions_skipped"]:
+            st.caption(f"({result['questions_added']} questions added, {result['questions_skipped']} skipped for not matching the expected format.)")
+        gen_state["result"] = None
+        st.rerun()
 
 def _render_setup_screen(username: str, active_subject: str, active_chapter: str, target_language: str):
     _render_generate_form(username, active_subject, active_chapter, target_language)
@@ -427,3 +494,4 @@ def render_question_paper_tab(username: str, active_subject: str = None, active_
         _render_question_screen()
     else:
         _render_results_screen(username, target_language)
+        
