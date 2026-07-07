@@ -246,6 +246,29 @@ def _render_setup_screen(username: str, active_subject: str, active_chapter: str
         st.info("You haven't generated any question papers yet -- use \"Generate a new question paper\" above to create one.")
         return
 
+    _render_paper_picker(username, papers)
+
+
+@st.fragment
+def _render_paper_picker(username: str, papers: list):
+    """
+    Selecting a paper, switching Practice/Test mode, or changing the timer
+    preset are all plain widget interactions -- by default each one causes
+    a FULL script rerun, which tears down and remounts BOTH levels of
+    nested st.tabs() (the main app tabs in app.py, and the Practice & Exams
+    sub-tabs in tab_practice.py). Streamlit briefly shows every tab panel's
+    content stacked together while that remount is in flight -- a confirmed
+    upstream quirk (see streamlit/streamlit community reports on st.tabs
+    "glitch where all hidden tab content is shown at once during rerun"),
+    made more visible here by the double nesting and by ngrok's added
+    round-trip latency on every rerun.
+
+    Wrapping this whole picker in @st.fragment means picking a paper only
+    reruns THIS fragment -- the outer tabs never get torn down, so there's
+    nothing to remount and no flash. Only "Start", which actually needs to
+    swap the whole tab's content over to the question screen, does a real
+    (and rare, deliberate) full-app st.rerun().
+    """
     paper_labels = [f"{p['title']} ({p.get('subject') or 'General'}) — {p['total_marks']} marks" for p in papers]
     selected_idx = st.selectbox(
         "Choose one of your question papers:",
@@ -310,7 +333,9 @@ def _render_setup_screen(username: str, active_subject: str, active_chapter: str
             "qp_submitted": False,
             "qp_result": None,
         })
-        st.rerun()
+        st.rerun()  # deliberate full-app rerun -- this transition really does
+                    # need to swap the tab's whole content over to the question
+                    # screen, so remounting the tabs here is expected and fine.
 
 
 def _render_answer_input(question: dict, idx: int):
