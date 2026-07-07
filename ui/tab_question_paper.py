@@ -293,7 +293,7 @@ def _render_answer_input(question: dict, idx: int):
             format_func=lambda k: f"{k}. {options[k]}",
             key=f"qp_input_{idx}_ar",
         )
-        st.session_state.qp_answers[qid] = {"question_id": qid, "answer_option": choice}
+        st.session_state.qp_answers[qid] = {"question_id": qid, "answer_option": str(choice)}
         
     elif qtype == "mcq":
         extra = question.get("extra") or {}
