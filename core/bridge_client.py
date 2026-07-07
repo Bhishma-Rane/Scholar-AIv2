@@ -12,6 +12,13 @@ ui/auth.py, core/llm.py) should call these functions and not touch
 in one place.
 
 CHANGE LOG (this revision):
+  - ollama_chat() / ollama_generate() now accept an optional `feature`
+    kwarg, forwarded to storage_bridge.py's /ollama/chat and
+    /ollama/generate routes as req.feature. This is the fix for the tier
+    bug where every AI call (chat, quiz generation, flashcards, paper
+    generation) was being checked against the bridge's hardcoded
+    "ai_chat" gate no matter what it actually was -- see core/llm.py's
+    get_llm()/BridgeChatLLM, which is what actually sets this per call.
   - Added ollama_embed() -- routes embedding requests through
     storage_bridge.py's /ollama/embed route instead of calling Ollama
     directly. Mirrors ollama_chat()/ollama_generate() below, which fixed
@@ -271,13 +278,21 @@ def delete_file(username: str, subject: str, filename: str) -> None:
 # cause of the tier bug).
 # ---------------------------------------------------------------------
 def ollama_chat(username: str, model: str, messages: list, options: dict = None,
-                 format: str = None, timeout: float = None) -> dict:
+                 format: str = None, timeout: float = None, feature: str = None) -> dict:
     """
     messages: list of {"role": "user"|"assistant"|"system", "content": str}
+
+    `feature` tells the bridge which FEATURE_MIN_TIER/DAILY_CAPS key to
+    gate this call as -- e.g. "ai_chat", "quiz_generation", "flashcards",
+    "question_paper". If omitted, the bridge defaults to "ai_chat" for
+    backward compatibility, so ALWAYS pass this explicitly for anything
+    that isn't plain chat (see core/llm.py's get_llm(), which sets this
+    per call site).
+
     Raises BridgeRequestError(status_code=402) if the account isn't active,
-    403 if the tier is too low for "ai_chat", 429 if today's daily cap is
-    hit. Returns the raw Ollama chat response dict (same shape Ollama's
-    own /api/chat returns), e.g. result["message"]["content"].
+    403 if the tier is too low for the given feature, 429 if today's daily
+    cap is hit. Returns the raw Ollama chat response dict (same shape
+    Ollama's own /api/chat returns), e.g. result["message"]["content"].
 
     `options`, if given, is forwarded as-is to Ollama's /api/chat as its
     per-request generation params dict -- most usefully {"num_predict":
@@ -302,6 +317,8 @@ def ollama_chat(username: str, model: str, messages: list, options: dict = None,
         payload["options"] = options
     if format:
         payload["format"] = format
+    if feature:
+        payload["feature"] = feature
     return _post(
         "/ollama/chat",
         json=payload,
@@ -309,14 +326,17 @@ def ollama_chat(username: str, model: str, messages: list, options: dict = None,
     )
 
 
-def ollama_generate(username: str, model: str, prompt: str, system: str = None) -> dict:
+def ollama_generate(username: str, model: str, prompt: str, system: str = None, feature: str = None) -> dict:
     """
-    Same gating as ollama_chat(). Returns the raw Ollama generate response
+    Same gating as ollama_chat(). `feature` works identically -- see
+    ollama_chat()'s docstring. Returns the raw Ollama generate response
     dict, e.g. result["response"].
     """
     payload = {"username": username, "model": model, "prompt": prompt}
     if system:
         payload["system"] = system
+    if feature:
+        payload["feature"] = feature
     return _post("/ollama/generate", json=payload, timeout=LLM_REQUEST_TIMEOUT)
 
 
