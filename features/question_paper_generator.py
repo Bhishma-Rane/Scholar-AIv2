@@ -168,12 +168,19 @@ MAX_TOTAL_QUESTIONS = 60
 # _generate_all_items -- that worst case hits per-item, not per-paper).
 MAX_ITEM_ATTEMPTS = 3
 
-# Upper bound on concurrent LLM calls in flight at once. A single local
-# Ollama instance often can't truly run more than 1-2 generations at a
-# time anyway (it just queues the rest), but capping this protects
-# against accidentally opening 15+ simultaneous HTTP connections through
-# the ngrok tunnel if someone requests a huge paper.
-MAX_CONCURRENT_ITEM_CALLS = 4
+# Upper bound on concurrent LLM calls in flight at once. Set to 1:
+# a single local Ollama instance can only actually run ONE generation at
+# a time (it queues everything else), so "concurrent" calls here don't
+# get real parallelism -- they just pile up behind each other. Worse,
+# each queued call still burns down its own ITEM_TIMEOUT_SECONDS client-
+# side clock while waiting in Ollama's queue, so it can get marked as
+# "timed out" and retried before it ever got a real chance to run --
+# and the retry adds yet another call to the same queue, compounding the
+# pileup. (Previously this was 4, which is what caused every question
+# type to fail/timeout at once -- see invoke_with_timeout's fix for the
+# other half of this.) Only raise this above 1 if Ollama is ever moved
+# to a backend that can genuinely serve concurrent generations.
+MAX_CONCURRENT_ITEM_CALLS = 1
 
 # How long a cached chapter_text stays valid. Chapter content in this
 # app doesn't change on a per-minute basis, so a generous TTL is safe;
@@ -876,12 +883,14 @@ def generate_question_paper(
     # "paper" model_type -- see core/llm.py -- is sized (num_predict) for
     # ONE TYPE's worth of questions per call. ITEM_TIMEOUT_SECONDS is per
     # call; with retries this means several small, fast calls per item
-    # instead of one huge one that silently truncates. Kept at 25s (the
-    # low end of the recommended 25-35s window) since items now run in
-    # parallel, so a tighter per-call budget no longer risks starving
-    # later items of time the way it would have in the old sequential
-    # loop.
-    ITEM_TIMEOUT_SECONDS = 25
+    # instead of one huge one that silently truncates. Raised from 25s
+    # now that MAX_CONCURRENT_ITEM_CALLS is back to 1 (items run
+    # sequentially, not in parallel) -- 25s was only safe under the
+    # (incorrect) assumption that a local Ollama instance could serve
+    # multiple calls at once. Measure your own machine's typical
+    # single-call latency for the "paper" model_type (3072-token budget)
+    # and adjust if you're still seeing frequent timeouts.
+    ITEM_TIMEOUT_SECONDS = 60
     llm = get_llm(model_type="paper", username=username, request_timeout=ITEM_TIMEOUT_SECONDS)
     if llm is None:
         raise ValueError("Could not connect to the LLM.")
