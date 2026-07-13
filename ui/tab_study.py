@@ -108,6 +108,29 @@ def _render_daily_goals(username: str, active_subject: str, active_chapter: str,
             st.success("🎉 All goals completed for today!")
 
 
+def _render_manage_materials(username: str, active_subject: str, active_chapter: str):
+    if active_chapter == "Select Chapter" or active_subject == "Select Subject":
+        return
+    paths = get_chapter_paths(username, active_subject, active_chapter)
+    guides_dir = paths["guides"]
+    existing = sorted(
+        f for f in os.listdir(guides_dir)
+        if f.endswith(".txt") and f != "Mistake_Notebook_Profile.txt"
+    ) if os.path.isdir(guides_dir) else []
+
+    if not existing:
+        return
+
+    with st.expander("🗑️ Manage Generated Materials", expanded=False):
+        for fname in existing:
+            label = fname.rsplit(".", 1)[0].replace("_", " ")
+            col1, col2 = st.columns([4, 1])
+            col1.write(label)
+            if col2.button("Delete", key=f"del_material_{fname}"):
+                os.remove(os.path.join(guides_dir, fname))
+                st.rerun()
+
+
 def _render_generate_subtab(username: str, active_subject: str, active_chapter: str, target_language: str):
     gen_mode = st.radio(
         "What would you like to generate?",
@@ -122,6 +145,9 @@ def _render_generate_subtab(username: str, active_subject: str, active_chapter: 
         _render_concept_map_generator(username, active_subject, active_chapter, target_language)
     else:
         _render_daily_goals(username, active_subject, active_chapter, target_language)
+
+    st.markdown("---")
+    _render_manage_materials(username, active_subject, active_chapter)
 
 
 def _render_mistake_notebook(username: str, active_subject: str, active_chapter: str):
