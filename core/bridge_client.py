@@ -480,6 +480,39 @@ def get_paper_attempt_result(attempt_id: int, username: str) -> dict:
     return _get("/papers/attempt_result", params={"attempt_id": attempt_id, "username": username})
 
 
+def delete_paper(username: str, paper_id: int) -> None:
+    """
+    Deletes a question paper (and its sections/questions/attempts) from
+    the bridge. Scoped to `username` on the bridge side so one account
+    can never delete another account's paper by guessing an id -- see
+    storage_bridge.py's /papers/delete route, which must check the
+    paper's owner matches the requesting username before deleting.
+    """
+    _post("/papers/delete", json={"username": username, "paper_id": paper_id})
+
+
+# ---------------------------------------------------------------------
+# Account deletion (full wipe -- see ui/tab_settings.py's Danger Zone)
+# ---------------------------------------------------------------------
+def delete_account(username: str, password: str) -> None:
+    """
+    Permanently deletes this account and everything tied to it on the
+    bridge: credentials, subjects, uploaded files, question papers +
+    attempts, quiz attempts, login tokens, theme/tutorial prefs.
+
+    The password is re-verified SERVER-SIDE here -- never trust a UI
+    gate alone for something this destructive. Raises BridgeRequestError
+    (401/403) if the password is wrong, BridgeUnavailableError if the
+    bridge can't be reached. Returns None on success.
+
+    NOTE: this only wipes bridge-side data. Callers must also call
+    core.paths.wipe_local_user_data(username) to clear locally-generated
+    study content (quizzes, flashcards, guides) and analytics.json,
+    since those live on Streamlit Cloud's local disk, not the bridge.
+    """
+    _post("/account/delete", json={"username": username, "password": password})
+
+
 # ---------------------------------------------------------------------
 # Theme color preference (persists per-account, follows them everywhere)
 # ---------------------------------------------------------------------
@@ -502,4 +535,3 @@ def get_tutorial_completed(username: str) -> bool:
 
 def set_tutorial_completed(username: str, completed: bool) -> None:
     _post("/users/tutorial_completed", json={"username": username, "completed": completed})
-  
