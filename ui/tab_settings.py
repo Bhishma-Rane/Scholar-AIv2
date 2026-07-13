@@ -9,8 +9,16 @@ basic account info.
 import streamlit as st
 
 from config import DEFAULT_THEME_COLOR
-from core.bridge_client import set_theme_color, BridgeUnavailableError, BridgeRequestError
+from core.bridge_client import (
+    set_theme_color,
+    verify_password,
+    delete_account,
+    BridgeUnavailableError,
+    BridgeRequestError,
+)
+from core.paths import wipe_local_user_data
 from core.onboarding_store import reset_tutorial
+from ui.auth import logout as auth_logout
 
 
 def _render_tutorial_section(username: str):
@@ -69,6 +77,74 @@ def _render_account_section(username: str):
     st.markdown(f"**Username:** {username}")
 
 
+def _render_danger_zone(username: str):
+    st.subheader("⚠️ Danger Zone")
+    st.caption("Permanently delete your account and everything in it. This cannot be undone.")
+
+    with st.expander("🗑️ Delete My Account", expanded=False):
+        st.error(
+            "This permanently deletes your account: every subject, uploaded file, quiz, "
+            "flashcard deck, study guide, question paper, and your entire study history. "
+            "**There is no way to recover this once it's done.**"
+        )
+
+        st.markdown("**Step 1 — confirm your password**")
+        confirm_password = st.text_input(
+            "Enter your current password:", type="password", key="wipe_confirm_password"
+        )
+
+        st.markdown(f"**Step 2 — type your username to confirm**")
+        confirm_username = st.text_input(
+            f"Type \"{username}\" exactly:", key="wipe_confirm_username"
+        )
+
+        ready = bool(confirm_password) and confirm_username.strip().lower() == username.strip().lower()
+
+        st.markdown("**Step 3 — confirm the deletion**")
+        if st.button(
+            "🔥 Permanently Delete My Account",
+            type="primary",
+            disabled=not ready,
+            key="wipe_final_confirm",
+        ):
+            # Re-verify the password ourselves before even attempting the
+            # wipe, so a wrong password fails fast with a clear message
+            # rather than surfacing as a generic bridge error. The bridge's
+            # own /account/delete route re-checks the password again
+            # server-side regardless -- this call is a UX nicety, not the
+            # actual security boundary.
+            try:
+                if not verify_password(username, confirm_password):
+                    st.error("Incorrect password. Nothing was deleted.")
+                    return
+            except BridgeUnavailableError:
+                st.error("Can't reach the account server right now. Please try again in a moment.")
+                return
+
+            try:
+                delete_account(username, confirm_password)
+            except BridgeRequestError as e:
+                st.error(f"Couldn't delete account: {e.detail}")
+                return
+            except BridgeUnavailableError:
+                st.error("Can't reach the account server right now. Your account was NOT deleted. Please try again shortly.")
+                return
+
+            # Bridge-side data (credentials, subjects, files, papers, quiz
+            # history) is gone. Now clear what's local to this container
+            # (generated quizzes/flashcards/guides, analytics.json) --
+            # see core/paths.py's wipe_local_user_data() docstring for why
+            # these two calls are separate.
+            wipe_local_user_data(username)
+
+            st.success("Your account has been permanently deleted.")
+            auth_logout()
+            st.rerun()
+
+        if not ready:
+            st.caption("Fill in both fields above with matching, correct values to enable this button.")
+
+
 def render_settings_tab(username: str):
     st.header("⚙️ Settings")
 
@@ -77,3 +153,5 @@ def render_settings_tab(username: str):
     _render_theme_section(username)
     st.markdown("---")
     _render_tutorial_section(username)
+    st.markdown("---")
+    _render_danger_zone(username)
