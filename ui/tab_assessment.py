@@ -16,42 +16,7 @@ import streamlit as st
 from core.paths import get_chapter_paths
 from core.analytics_store import record_quiz_attempt
 from features.mock_exams import grade_full_quiz
-
-
-# --- Font-size overrides for the assessment screen -------------------------
-# st.subheader() renders the question text larger than is comfortable for a
-# quiz reading flow, while st.radio()'s option labels render smaller than
-# the question — the opposite of what's readable. This CSS block rebalances
-# both. Scoped to this file only (injected once per render of this tab),
-# so it does not affect any other tab's styling.
-_ASSESSMENT_CSS = """
-<style>
-/* Question text (rendered via st.subheader inside the question screen) */
-div[data-testid="stSubheader"] p,
-div[data-testid="stSubheader"],
-div[data-testid="stSubheader"] h3 {
-    font-size: 1.25rem !important;
-    line-height: 1.5 !important;
-    font-weight: 400 !important;
-}
-
-/* Radio button option labels (the MCQ choices) */
-div[data-testid="stRadio"] label p {
-    font-size: 1.15rem !important;
-    line-height: 1.5 !important;
-}
-
-/* Text area for subjective/short-answer questions, for consistency */
-div[data-testid="stTextArea"] textarea {
-    font-size: 1.15rem !important;
-}
-</style>
-"""
-
-
-def _inject_assessment_css():
-    st.markdown(_ASSESSMENT_CSS, unsafe_allow_html=True)
-
+from ui.common_styles import inject_quiz_css
 
 def _render_setup_screen(username: str, active_subject: str, active_chapter: str, data_file: str):
     if os.path.exists(data_file):
