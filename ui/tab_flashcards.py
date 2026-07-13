@@ -197,3 +197,25 @@ def render_flashcards_tab(username: str, active_subject: str, active_chapter: st
             st.session_state.fc_idx = 0
             st.success("Progress reset.")
             st.rerun()
+
+        st.markdown("---")
+        st.subheader("🗑️ Delete a Card")
+        card_labels = [f"{i + 1}. {c['front'][:60]}" for i, c in enumerate(fc_data)]
+        card_to_delete = st.selectbox("Pick a card to remove:", range(len(fc_data)), format_func=lambda i: card_labels[i], key="fc_delete_card_select")
+        if st.button("Delete This Card", key="fc_delete_card_btn"):
+            del fc_data[card_to_delete]
+            _save_deck(fc_path, fc_data)
+            st.session_state.fc_idx = 0
+            st.success("Card deleted.")
+            st.rerun()
+
+        st.markdown("---")
+        st.subheader("🗑️ Delete Entire Deck")
+        with st.popover("Delete Entire Deck", use_container_width=True):
+            st.error(f"This permanently deletes all {len(fc_data)} cards for **{active_chapter}**. This can't be undone.")
+            if st.button("Confirm delete deck", type="primary", key="fc_delete_deck_confirm"):
+                os.remove(fc_path)
+                st.session_state.fc_idx = 0
+                st.success("Deck deleted.")
+                st.rerun()
+                
