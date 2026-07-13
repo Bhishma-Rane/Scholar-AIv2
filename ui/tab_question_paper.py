@@ -39,6 +39,7 @@ from core.bridge_client import (
     get_paper,
     start_paper_attempt,
     submit_paper_attempt,
+    delete_paper,
     BridgeUnavailableError,
     BridgeRequestError,
 )
@@ -277,6 +278,18 @@ def _render_paper_picker(username: str, papers: list):
         key="qp_selected_paper_idx",
     )
     selected_paper_summary = papers[selected_idx]
+
+    with st.popover("🗑️ Delete this paper"):
+        st.warning(f"Delete \"{selected_paper_summary['title']}\"? This also removes any attempts/results tied to it and can't be undone.")
+        if st.button("Confirm delete paper", type="primary", key=f"confirm_delete_paper_{selected_paper_summary['id']}"):
+            try:
+                delete_paper(username=username, paper_id=selected_paper_summary["id"])
+                st.success("Paper deleted.")
+                st.rerun(scope="fragment")
+            except BridgeRequestError as e:
+                st.error(f"Couldn't delete: {e.detail}")
+            except BridgeUnavailableError:
+                st.error("Can't reach the account server right now. Please try again in a moment.")
 
     mode = st.radio(
         "Mode:",
@@ -519,4 +532,3 @@ def render_question_paper_tab(username: str, active_subject: str = None, active_
         _render_question_screen()
     else:
         _render_results_screen(username, target_language)
-        
