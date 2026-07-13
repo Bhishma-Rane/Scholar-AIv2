@@ -43,6 +43,7 @@ from core.bridge_client import (
     BridgeUnavailableError,
     BridgeRequestError,
 )
+from ui.common_styles import inject_quiz_css, QUESTION_TEXT_CLASS
 
 TIMER_PRESETS = {
     "15 minutes": 15 * 60,
@@ -418,6 +419,8 @@ def _render_answer_input(question: dict, idx: int):
 
 
 def _render_question_screen():
+    inject_quiz_css()
+
     flat_questions = st.session_state.qp_flat_questions
     idx = st.session_state.qp_current_idx
     item = flat_questions[idx]
@@ -441,9 +444,15 @@ def _render_question_screen():
     marks_display = int(marks_value) if marks_value == int(marks_value) else marks_value
     marks_label = f" ({marks_display} mark{'s' if marks_value != 1 else ''})"
     if question.get("question_text"):
-        st.markdown(f"**Q{idx + 1}.** {question['question_text']}{marks_label}")
+        st.markdown(
+            f'<p class="{QUESTION_TEXT_CLASS}">Q{idx + 1}. {question["question_text"]}{marks_label}</p>',
+            unsafe_allow_html=True,
+        )
     else:
-        st.markdown(f"**Q{idx + 1}.**{marks_label}")
+        st.markdown(
+            f'<p class="{QUESTION_TEXT_CLASS}">Q{idx + 1}.{marks_label}</p>',
+            unsafe_allow_html=True,
+        )
 
     _render_answer_input(question, idx)
 
