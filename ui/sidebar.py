@@ -28,6 +28,9 @@ from core.paths import (
     list_subject_files,
     upload_subject_file,
     delete_subject_file,
+    delete_subject_remote,
+    delete_chapter_local_content,
+    delete_subject_local_content,
 )
 from core.bridge_client import BridgeUnavailableError, is_bridge_reachable
 from core.vectorstore import get_vector_store
@@ -138,27 +141,49 @@ def render_sidebar(username: str, user_paths: dict) -> dict:
                             st.error("Upload failed — storage bridge is unreachable. Please try again shortly.")
 
             if active_chapter != "Select Chapter":
-                if st.button("🗑️ Delete Selected Chapter", type="secondary"):
-                    try:
-                        for ext in [".txt", ".pdf"]:
-                            candidate = active_chapter + ext
-                            if candidate in subject_files:
-                                delete_subject_file(username, active_subject, candidate)
+                with st.popover("🗑️ Delete Selected Chapter", use_container_width=True):
+                    st.warning(f"Delete **{active_chapter}** and all its quizzes, flashcards, and study guides? This can't be undone.")
+                    if st.button("Confirm delete chapter", type="primary", key="confirm_delete_chapter"):
+                        try:
+                            for ext in [".txt", ".pdf"]:
+                                candidate = active_chapter + ext
+                                if candidate in subject_files:
+                                    delete_subject_file(username, active_subject, candidate)
 
-                        # Locally-generated study content (quizzes, flashcards,
-                        # etc.) is still on local disk for now — see
-                        # core/paths.py module docstring for the follow-up.
-                        import os
-                        import shutil
-                        study_folder = os.path.join(user_paths["study"], active_subject, active_chapter)
-                        if os.path.exists(study_folder):
-                            shutil.rmtree(study_folder)
+                            delete_chapter_local_content(username, active_subject, active_chapter)
 
-                        # Fix Issue #37: Rebuild vector db when files are deleted.
-                        get_vector_store(username, active_subject, force_rebuild=True)
-                        st.rerun()
-                    except BridgeUnavailableError:
-                        st.error("Delete failed — storage bridge is unreachable. Please try again shortly.")
+                            # Fix Issue #37: Rebuild vector db when files are deleted.
+                            get_vector_store(username, active_subject, force_rebuild=True)
+                            st.rerun()
+                        except BridgeUnavailableError:
+                            st.error("Delete failed — storage bridge is unreachable. Please try again shortly.")
+
+            # ------------------------------------------------------------
+            # Delete Entire Subject — higher blast radius than a chapter
+            # delete (every chapter, file, and generated study item under
+            # it), so this asks the person to type the subject name back
+            # rather than just clicking a button, to guard against a
+            # misclick nuking an entire subject by accident.
+            # ------------------------------------------------------------
+            with st.popover("🗑️ Delete Entire Subject", use_container_width=True):
+                st.error(
+                    f"This permanently deletes **{active_subject}** — every chapter, uploaded file, "
+                    f"quiz, flashcard deck, and study guide under it. This cannot be undone."
+                )
+                typed_subject = st.text_input(
+                    f"Type \"{active_subject}\" to confirm:", key="confirm_delete_subject_text"
+                )
+                if st.button("Confirm delete subject", type="primary", key="confirm_delete_subject_btn"):
+                    if typed_subject.strip() != active_subject:
+                        st.error("That doesn't match the subject name. Nothing was deleted.")
+                    else:
+                        try:
+                            delete_subject_remote(username, active_subject)
+                            delete_subject_local_content(username, active_subject)
+                            st.success(f"Deleted subject \"{active_subject}\".")
+                            st.rerun()
+                        except BridgeUnavailableError:
+                            st.error("Delete failed — storage bridge is unreachable. Please try again shortly.")
 
         st.markdown("---")
         data_source = st.radio("Data Source:", DATA_SOURCES)
