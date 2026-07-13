@@ -18,6 +18,7 @@ from core.analytics_store import record_quiz_attempt
 from features.mock_exams import grade_full_quiz
 from ui.common_styles import inject_quiz_css
 
+
 def _render_setup_screen(username: str, active_subject: str, active_chapter: str, data_file: str):
     if os.path.exists(data_file):
         st.session_state.negative_marking_enabled = st.toggle(
@@ -152,3 +153,4 @@ def render_assessment_tab(username: str, active_subject: str, active_chapter: st
         _render_question_screen()
     else:
         _render_results_screen(username, active_subject, active_chapter, target_language)
+
