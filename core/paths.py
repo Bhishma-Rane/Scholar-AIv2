@@ -122,3 +122,50 @@ def download_subject_file(username: str, subject: str, filename: str) -> bytes:
 def delete_subject_file(username: str, subject: str, filename: str) -> None:
     """Deletes a single file from the bridge."""
     bridge_client.delete_file(username, subject, filename)
+
+
+# ---------------------------------------------------------------------
+# Local cleanup helpers (chapter/subject/account deletes)
+# ---------------------------------------------------------------------
+# Generated study content (quizzes, mock exams, guides, flashcards) still
+# lives on local disk per the module docstring above, so every delete
+# path that removes a subject/chapter/account on the bridge must ALSO
+# clear the matching local folder here, or orphaned generated content
+# keeps showing up after the "source of truth" (the bridge) has already
+# forgotten the subject/chapter/account ever existed.
+
+def delete_chapter_local_content(username: str, subject: str, chapter: str) -> None:
+    """Removes a single chapter's locally-generated content (quizzes,
+    mock exams, study guides, flashcards). Safe to call even if nothing
+    was ever generated for this chapter."""
+    import shutil
+    paths = get_user_paths(username, subject)
+    safe_chapter = sanitize_filename(chapter)
+    chapter_folder = os.path.join(paths["subject_study"], safe_chapter)
+    if os.path.exists(chapter_folder):
+        shutil.rmtree(chapter_folder)
+
+
+def delete_subject_local_content(username: str, subject: str) -> None:
+    """Removes ALL locally-generated content for every chapter under a
+    subject (used when the whole subject is deleted, not just one
+    chapter). Does not touch the bridge -- call delete_subject_remote()
+    separately for that."""
+    import shutil
+    paths = get_user_paths(username, subject)
+    if os.path.exists(paths["subject_study"]):
+        shutil.rmtree(paths["subject_study"])
+
+
+def wipe_local_user_data(username: str) -> None:
+    """Removes EVERYTHING local for this user: generated study content
+    for every subject, analytics.json (quiz history/streaks), and the
+    local ChromaDB. Used by full account deletion. Does not touch the
+    bridge (credentials, subjects, uploaded files, question papers,
+    login tokens) -- call bridge_client.delete_account() separately for
+    that, since those live on the bridge, not here."""
+    import shutil
+    safe_user = sanitize_filename(username).lower()
+    user_root = os.path.join(USERS_DIR, safe_user)
+    if os.path.exists(user_root):
+        shutil.rmtree(user_root)
