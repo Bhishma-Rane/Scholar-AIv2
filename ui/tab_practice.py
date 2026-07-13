@@ -30,29 +30,7 @@ from core.analytics_store import record_quiz_attempt
 from features.mock_exams import grade_full_quiz
 from features.chat_graph import vedic_graph
 from ui.tab_question_paper import render_question_paper_tab
-
-_ASSESSMENT_CSS = """
-<style>
-div[data-testid="stSubheader"] p,
-div[data-testid="stSubheader"],
-div[data-testid="stSubheader"] h3 {
-    font-size: 1.25rem !important;
-    line-height: 1.5 !important;
-    font-weight: 400 !important;
-}
-div[data-testid="stRadio"] label p {
-    font-size: 1.15rem !important;
-    line-height: 1.5 !important;
-}
-div[data-testid="stTextArea"] textarea {
-    font-size: 1.15rem !important;
-}
-</style>
-"""
-
-
-def _inject_assessment_css():
-    st.markdown(_ASSESSMENT_CSS, unsafe_allow_html=True)
+from ui.common_styles import inject_quiz_css
 
 
 def _render_generate_quiz_subtab(username: str, active_subject: str, active_chapter: str, target_language: str):
@@ -134,7 +112,7 @@ def _render_quiz_setup_screen(username: str, active_subject: str, active_chapter
 
 
 def _render_quiz_question_screen():
-    _inject_assessment_css()
+    inject_quiz_css()
 
     q_idx = st.session_state.current_q
     quiz_data = st.session_state.quiz_data
