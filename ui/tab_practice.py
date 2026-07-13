@@ -57,6 +57,19 @@ def _inject_assessment_css():
 
 def _render_generate_quiz_subtab(username: str, active_subject: str, active_chapter: str, target_language: str):
     st.caption("Generate a digital, auto-graded quiz from this chapter — then take it in the next sub-tab.")
+
+    if active_chapter != "Select Chapter":
+        paths = get_chapter_paths(username, active_subject, active_chapter)
+        data_file = os.path.join(paths["mcq"], f"{active_chapter}_Data.json")
+        if os.path.exists(data_file):
+            st.info(f"A quiz already exists for **{active_chapter}**. Generating again will overwrite it.")
+            with st.popover("🗑️ Delete This Quiz"):
+                st.warning("This deletes the generated quiz for this chapter. It can't be undone.")
+                if st.button("Confirm delete quiz", type="primary", key="delete_quiz_confirm"):
+                    os.remove(data_file)
+                    st.success("Quiz deleted.")
+                    st.rerun()
+
     num_qs = st.number_input("Number of Questions", min_value=5, max_value=50, value=5, step=5)
     if st.button("🚀 Generate Digital Quiz", type="primary"):
         if active_chapter == "Select Chapter":
