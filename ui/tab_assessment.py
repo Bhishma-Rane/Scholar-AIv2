@@ -51,7 +51,7 @@ def _render_setup_screen(username: str, active_subject: str, active_chapter: str
 
 
 def _render_question_screen():
-    _inject_assessment_css()
+    inject_quiz_css()
 
     q_idx = st.session_state.current_q
     quiz_data = st.session_state.quiz_data
