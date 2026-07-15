@@ -746,6 +746,11 @@ def issue_token(req: VerifyPasswordRequest, x_bridge_secret: Optional[str] = Hea
         if not hmac.compare_digest(candidate_hash, row["password_hash"]):
             return {"valid": False, "token": None}
 
+        # Single active session: logging in anywhere invalidates every
+        # other device's token for this account, so a shared password
+        # can't be used from two places at once.
+        conn.execute("DELETE FROM login_tokens WHERE username = ?", (username,))
+
         token = secrets.token_urlsafe(TOKEN_BYTES)
         now = time.time()
         conn.execute(
@@ -1911,78 +1916,6 @@ def debug_db_path():
         "db_size_bytes": DB_PATH.stat().st_size if DB_PATH.exists() else None,
         "script_location": str(Path(__file__).resolve().parent),
     }
-
-import secrets
-from datetime import datetime, timezone
-from fastapi import Header, HTTPException
-from pydantic import BaseModel
-
-class SessionCreateRequest(BaseModel):
-    username: str
-    device_info: str | None = None
-
-class SessionValidateRequest(BaseModel):
-    username: str
-    session_token: str
-
-def _check_secret(x_bridge_secret: str = Header(...)):
-    if x_bridge_secret != os.environ.get("BRIDGE_SHARED_SECRET"):
-        raise HTTPException(status_code=401, detail="invalid bridge secret")
-
-@app.post("/session/create")
-def create_session(req: SessionCreateRequest, _=Depends(_check_secret)):
-    """Called on login. Issues a fresh token and invalidates any prior session."""
-    token = secrets.token_hex(32)
-    now = datetime.now(timezone.utc).isoformat()
-
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE users SET session_token = ?, session_updated_at = ?, session_device_info = ? WHERE username = ?",
-        (token, now, req.device_info, req.username),
-    )
-    if cur.rowcount == 0:
-        conn.close()
-        raise HTTPException(status_code=404, detail="user not found")
-    conn.commit()
-    conn.close()
-
-    return {"session_token": token, "issued_at": now}
-
-@app.post("/session/validate")
-def validate_session(req: SessionValidateRequest, _=Depends(_check_secret)):
-    """Called periodically by the client to check if this session is still the active one."""
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT session_token FROM users WHERE username = ?", (req.username,))
-    row = cur.fetchone()
-    conn.close()
-
-    if row is None:
-        return {"valid": False, "reason": "user_not_found"}
-
-    stored_token = row[0]
-    if stored_token is None:
-        return {"valid": False, "reason": "no_active_session"}
-
-    if stored_token != req.session_token:
-        return {"valid": False, "reason": "superseded_by_other_device"}
-
-    return {"valid": True}
-
-@app.post("/session/logout")
-def logout_session(req: SessionValidateRequest, _=Depends(_check_secret)):
-    """Explicit logout — clears the active session so no token is valid."""
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE users SET session_token = NULL WHERE username = ? AND session_token = ?",
-        (req.username, req.session_token),
-    )
-    conn.commit()
-    conn.close()
-    return {"ok": True}
-
 
 @app.get("/health")
 def health():
