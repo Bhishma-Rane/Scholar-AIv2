@@ -62,6 +62,37 @@ def _try_auto_login_from_url():
         st.session_state.login_token = token
 
 
+SESSION_CHECK_INTERVAL_SECONDS = 20
+
+
+def _verify_active_session():
+    """Detects if a newer login (e.g. on another device) has superseded this
+    session's token, and force-logs-out this session if so. Runs on every
+    rerun but throttled so it doesn't hammer the bridge on every widget click."""
+    token = st.session_state.get("login_token")
+    if not token:
+        return
+
+    now = time.time()
+    last_check = st.session_state.get("_last_session_check", 0.0)
+    if now - last_check < SESSION_CHECK_INTERVAL_SECONDS:
+        return
+    st.session_state["_last_session_check"] = now
+
+    try:
+        active_username = verify_login_token(token)
+    except BridgeUnavailableError:
+        return  # fail open on a bridge blip, don't kick someone out for that
+
+    if active_username != st.session_state.get("logged_in_user"):
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
+        if TOKEN_QUERY_PARAM in st.query_params:
+            del st.query_params[TOKEN_QUERY_PARAM]
+        st.error("You've been logged out because this account was signed in elsewhere.")
+        st.stop()
+
+
 def _render_login_form():
     st.subheader("Login")
     username_input = st.text_input("Username:", key="login_username")
@@ -92,14 +123,18 @@ def _render_login_form():
             _record_successful_login()
             st.session_state.logged_in_user = clean_username
 
-            if stay_logged_in:
-                try:
-                    token = issue_login_token(clean_username, password_input)
-                    if token:
-                        st.session_state.login_token = token
+            # Always issue a token, even for "don't stay logged in" sessions --
+            # this is what lets us detect a kickout on THIS device when someone
+            # else logs in elsewhere (see _verify_active_session below). Only
+            # persist it to the URL if the user opted into staying logged in.
+            try:
+                token = issue_login_token(clean_username, password_input)
+                if token:
+                    st.session_state.login_token = token
+                    if stay_logged_in:
                         st.query_params[TOKEN_QUERY_PARAM] = token
-                except BridgeUnavailableError:
-                    pass
+            except BridgeUnavailableError:
+                pass
 
             st.rerun()
         else:
@@ -257,4 +292,5 @@ def require_login() -> str:
                     _render_forgot_password_form()
         st.stop()
 
+    _verify_active_session()
     return st.session_state.logged_in_user
