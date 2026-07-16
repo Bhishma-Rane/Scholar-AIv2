@@ -4,15 +4,9 @@ import streamlit as st
 
 from config import MIN_PASSWORD_LENGTH
 from core.credentials import (
-    create_account,
-    user_exists,
-    verify_password,
-    issue_login_token,
-    verify_login_token,
-    revoke_login_token,
-    reset_password,
-    BridgeUnavailableError,
-    BridgeRequestError,
+    create_account, user_exists, verify_password, issue_login_token,
+    verify_login_token, revoke_login_token, reset_password,
+    BridgeUnavailableError, BridgeRequestError, AccountDisabledError,
 )
 
 MAX_ATTEMPTS_BEFORE_COOLDOWN = 5
@@ -89,7 +83,7 @@ def _verify_active_session():
             del st.session_state[key]
         if TOKEN_QUERY_PARAM in st.query_params:
             del st.query_params[TOKEN_QUERY_PARAM]
-        st.error("You've been logged out because this account was signed in elsewhere.")
+        st.error("You've been signed out. This may be because your account was signed in elsewhere, or your access was changed.")
         st.stop()
 
 
@@ -112,6 +106,9 @@ def _render_login_form():
 
         try:
             valid = verify_password(clean_username, password_input)
+        except AccountDisabledError:
+            st.error("This account has been disabled. Contact Bhishma if you think this is a mistake.")
+            return
         except BridgeUnavailableError:
             st.error(
                 "Can't reach the account server right now (the storage bridge "
