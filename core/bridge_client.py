@@ -76,6 +76,12 @@ class BridgeUnavailableError(Exception):
     as opposed to a normal application-level failure like 'wrong password'."""
     pass
 
+class AccountDisabledError(Exception):
+    """Raised when an account exists and the password is correct (or would
+    be), but the account has been disabled by the admin. Distinct from a
+    wrong password so the UI can show a real explanation instead of
+    'incorrect username or password'."""
+    pass
 
 class BridgeRequestError(Exception):
     """
@@ -180,8 +186,9 @@ def user_exists(username: str) -> bool:
 
 def verify_password(username: str, password: str) -> bool:
     result = _post("/auth/verify_password", json={"username": username, "password": password})
+    if result.get("disabled"):
+        raise AccountDisabledError()
     return result["valid"]
-
 
 def issue_login_token(username: str, password: str):
     result = _post("/auth/issue_token", json={"username": username, "password": password})
