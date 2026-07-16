@@ -8,18 +8,13 @@ from core.bridge_client import (
     reset_password as _bridge_reset_password,
     BridgeUnavailableError,
     BridgeRequestError,
+    AccountDisabledError,
 )
 
 __all__ = [
-    "create_account",
-    "user_exists",
-    "verify_password",
-    "issue_login_token",
-    "verify_login_token",
-    "revoke_login_token",
-    "reset_password",
-    "BridgeUnavailableError",
-    "BridgeRequestError",
+    "create_account", "user_exists", "verify_password", "issue_login_token",
+    "verify_login_token", "revoke_login_token", "reset_password",
+    "BridgeUnavailableError", "BridgeRequestError", "AccountDisabledError",
 ]
 
 
