@@ -331,6 +331,12 @@ def _init_db():
             conn.execute("ALTER TABLE users ADD COLUMN subscription_status TEXT NOT NULL DEFAULT 'inactive'")
         if not _column_exists(conn, "users", "subscription_expires_at"):
             conn.execute("ALTER TABLE users ADD COLUMN subscription_expires_at TEXT")
+        if not _column_exists(conn, "users", "is_disabled"):
+            # Separate from subscription_status on purpose: subscription answers
+            # "does this account have paid access to gated features", is_disabled
+            # answers "can this account log in at all". Deactivating a subscription
+            # must never silently double as a login-block, and vice versa.
+            conn.execute("ALTER TABLE users ADD COLUMN is_disabled INTEGER NOT NULL DEFAULT 0")
         if not _column_exists(conn, "users", "subscription_plan"):
             conn.execute("ALTER TABLE users ADD COLUMN subscription_plan TEXT")
         if not _column_exists(conn, "users", "subscription_notes"):
@@ -709,48 +715,34 @@ def set_tutorial_completed(req: SetTutorialCompletedRequest, x_bridge_secret: Op
 def verify_password(req: VerifyPasswordRequest, x_bridge_secret: Optional[str] = Header(None)):
     _require_secret(x_bridge_secret)
     username = req.username.strip().lower()
-
     with contextlib.closing(_get_conn()) as conn:
         row = conn.execute(
-            "SELECT salt, password_hash FROM users WHERE username = ?", (username,)
+            "SELECT salt, password_hash, is_disabled FROM users WHERE username = ?", (username,)
         ).fetchone()
-
-    if row is None:
-        return {"valid": False}
-
-    salt = bytes.fromhex(row["salt"])
-    candidate_hash = _hash_password(req.password, salt)
-    valid = hmac.compare_digest(candidate_hash, row["password_hash"])
-    return {"valid": valid}
-
+        if row is None:
+            return {"valid": False}
+        if row["is_disabled"]:
+            return {"valid": False, "disabled": True}
+        salt = bytes.fromhex(row["salt"])
+        candidate_hash = _hash_password(req.password, salt)
+        valid = hmac.compare_digest(candidate_hash, row["password_hash"])
+        return {"valid": valid}
 
 @app.post("/auth/issue_token")
 def issue_token(req: VerifyPasswordRequest, x_bridge_secret: Optional[str] = Header(None)):
-    """
-    Verifies the password AND, if valid, issues a long-lived login token.
-    Called once at successful login; the token then goes into the
-    browser's URL so a page reload can skip the password form.
-    """
     _require_secret(x_bridge_secret)
     username = req.username.strip().lower()
-
     with contextlib.closing(_get_conn()) as conn:
         row = conn.execute(
-            "SELECT salt, password_hash FROM users WHERE username = ?", (username,)
+            "SELECT salt, password_hash, is_disabled FROM users WHERE username = ?", (username,)
         ).fetchone()
-        if row is None:
+        if row is None or row["is_disabled"]:
             return {"valid": False, "token": None}
-
         salt = bytes.fromhex(row["salt"])
         candidate_hash = _hash_password(req.password, salt)
         if not hmac.compare_digest(candidate_hash, row["password_hash"]):
             return {"valid": False, "token": None}
-
-        # Single active session: logging in anywhere invalidates every
-        # other device's token for this account, so a shared password
-        # can't be used from two places at once.
         conn.execute("DELETE FROM login_tokens WHERE username = ?", (username,))
-
         token = secrets.token_urlsafe(TOKEN_BYTES)
         now = time.time()
         conn.execute(
@@ -758,26 +750,26 @@ def issue_token(req: VerifyPasswordRequest, x_bridge_secret: Optional[str] = Hea
             (token, username, now, now + TOKEN_TTL_SECONDS),
         )
         conn.commit()
-
-    return {"valid": True, "token": token}
-
+        return {"valid": True, "token": token}
 
 @app.post("/auth/verify_token")
 def verify_token(req: VerifyTokenRequest, x_bridge_secret: Optional[str] = Header(None)):
-    """Used on every page load to silently re-authenticate from the URL token."""
+    """Used on every page load to silently re-authenticate from the URL token.
+    Also re-checks is_disabled every time -- this is what actually kicks out
+    an already-logged-in session within ~20s of an admin disabling the
+    account (see ui/auth.py's _verify_active_session), not just new logins."""
     _require_secret(x_bridge_secret)
-
     with contextlib.closing(_get_conn()) as conn:
         row = conn.execute(
-            "SELECT username, expires_at FROM login_tokens WHERE token = ?", (req.token,)
+            "SELECT login_tokens.username, login_tokens.expires_at, users.is_disabled "
+            "FROM login_tokens JOIN users ON users.username = login_tokens.username "
+            "WHERE login_tokens.token = ?",
+            (req.token,),
         ).fetchone()
-
-        if row is None or row["expires_at"] < time.time():
+        if row is None or row["expires_at"] < time.time() or row["is_disabled"]:
             return {"valid": False, "username": None}
-
         return {"valid": True, "username": row["username"]}
-
-
+    
 @app.post("/auth/revoke_token")
 def revoke_token(req: VerifyTokenRequest, x_bridge_secret: Optional[str] = Header(None)):
     """Called on logout, so the old token can't be reused."""
