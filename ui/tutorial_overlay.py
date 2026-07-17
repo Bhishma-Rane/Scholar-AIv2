@@ -1,78 +1,34 @@
 """
 ui/tutorial_overlay.py
 =========================
-A simple tooltip-box guided tour: no screen dimming, no spotlight
-cutout -- just a small box with the step's instructions, positioned
-right next to the real widget it's talking about. Draws over the real,
-already-rendered app (see ui/tab_tutorial.py + app.py for how that's
-guaranteed).
+Guided tour: a highlight box drawn around the real target element,
+plus a small tooltip box with the step's instructions, connected by
+a short arrow. Draws over the real, already-rendered app (see
+ui/tab_tutorial.py + app.py for how that's guaranteed).
 
-(Earlier versions of this file used a dimmed spotlight overlay. That
-was dropped by request -- a plain positioned tooltip is simpler and
-avoids an entire class of "the highlight box doesn't move / covers the
-wrong thing" bugs, since there's only one visual element to keep in
-sync with the target instead of two.)
+CHANGED: earlier versions used only a floating tooltip with no visual
+marker on the target itself -- users reported the tour "just scrolls
+the sidebar" with nothing telling them what to actually click. This
+version adds a pulsing highlight box drawn at the target's own
+bounding rect (so it's obviously "this exact thing"), plus a small
+arrow from the box to the tooltip so the two visually belong together.
 
-HOW TARGETING WORKS:
-Each step (defined in ui/tutorial_content.py, inside PATHWAYS) carries a
-`target` dict describing HOW to find the real element, by its actual
-visible label/text rather than a guessed CSS selector or sibling index
-(both of which break silently the moment Streamlit's internal markup
-shifts, or another element appears earlier in the DOM). Supported types:
-
-  - {"type": "css", "selector": "..."}
-        A single, genuinely unique element. querySelector directly.
-        Used for things like the sidebar container itself.
-
-  - {"type": "tab_text", "text": "💬 Tutor"}
-        A tab button, matched by its exact visible label among all
-        `button[data-baseweb='tab']` elements.
-
-  - {"type": "widget_label", "label": "Active Chapter", "container": "stSelectbox"}
-        An input/selectbox/uploader, found by its label text among
-        `[data-testid='stWidgetLabel']` elements, then widened to the
-        nearest ancestor matching the given container testid (e.g.
-        stTextInput, stSelectbox, stFileUploader, stNumberInput) so the
-        tooltip anchors to the whole widget, not just the (possibly
-        visually hidden) label text itself.
-
-  - {"type": "button_text", "text": "Create"}
-        A plain button, matched by its exact visible text.
-
-If a target can't be resolved (label wording drifted, element not yet
-rendered, etc.) the tooltip falls back to a centered position rather
-than crashing -- console.warn logs the reason.
-
-LIMITATION: this overlay lives in an iframe (st.iframe always sandboxes
-its content), so it cannot directly see elements in the parent
-Streamlit page through normal means -- but Streamlit's component
-iframes ARE same-origin with the parent page, so `window.parent.document`
-is reachable. That's what makes targeting real elements possible at all.
-
-IMPORTANT: the CSS for #tutorial-tooltip is injected into the PARENT
-document (once, guarded by an id check) rather than left in this
-iframe's own <style> block -- the tooltip div is created via
-`parentDoc.createElement(...)` and appended to `parentDoc.body`, so it
-lives in the parent page's DOM, and a stylesheet scoped to this
-iframe's own srcdoc never applies to it.
-
-NAVIGATION: the actual Next/Back/Skip controls are plain Streamlit
-buttons rendered OUTSIDE this component (in tab_tutorial.py, right below
-the call to render_tutorial_overlay()) -- an iframe can't host clickable
-Streamlit widgets itself, so this component is visual-only and the real
-interaction happens via normal st.button calls alongside it.
+HOW TARGETING WORKS: unchanged from before -- see ui/tutorial_content.py
+PATHWAYS for the `target` spec format (css / tab_text / button_text /
+widget_label). If a target can't be resolved, both the highlight box
+and tooltip fall back to a centered position rather than crashing --
+console.warn logs the reason.
 
 USAGE (see ui/tab_tutorial.py for the full integration):
     render_tutorial_overlay(steps, step_index)
     # ...then separately, plain st.button("Next"), st.button("Back"), etc.
 """
-import json
 
+import json
 import streamlit as st
 
-# CSS for the tooltip box. Injected into the PARENT document once -- it
-# styles an element that lives in the parent's DOM, not in this
-# iframe's own document.
+# CSS injected into the PARENT document once -- styles elements that
+# live in the parent's DOM, not in this iframe's own document.
 _OVERLAY_CSS = """
 #tutorial-tooltip {
     position: fixed;
@@ -80,7 +36,7 @@ _OVERLAY_CSS = """
     border-radius: 10px;
     padding: 16px 20px;
     max-width: 320px;
-    box-shadow: 0 8px 30px rgba(0,0,0,0.3);
+    box-shadow: 0 8px 30px rgba(0,0,0,0.35);
     z-index: 999999;
     font-family: sans-serif;
 }
@@ -100,14 +56,30 @@ _OVERLAY_CSS = """
     font-size: 12px;
     color: #888;
 }
+#tutorial-highlight-box {
+    position: fixed;
+    border: 3px solid #ff9d2f;
+    border-radius: 8px;
+    box-shadow: 0 0 0 4000px rgba(0,0,0,0.45), 0 0 16px 4px rgba(255,157,47,0.8);
+    z-index: 999998;
+    pointer-events: none;
+    animation: tutorial-pulse 1.4s ease-in-out infinite;
+    transition: top 0.25s ease, left 0.25s ease, width 0.25s ease, height 0.25s ease;
+}
+@keyframes tutorial-pulse {
+    0%   { box-shadow: 0 0 0 4000px rgba(0,0,0,0.45), 0 0 10px 2px rgba(255,157,47,0.7); }
+    50%  { box-shadow: 0 0 0 4000px rgba(0,0,0,0.45), 0 0 22px 8px rgba(255,157,47,1); }
+    100% { box-shadow: 0 0 0 4000px rgba(0,0,0,0.45), 0 0 10px 2px rgba(255,157,47,0.7); }
+}
 """
 
 
 def render_tutorial_overlay(steps: list, step_index: int):
     """
-    Renders the tooltip box for the given step, positioned next to its
-    resolved target (or centered if the target can't be found). Pair
-    this with real st.button calls right after for Next/Back/Skip.
+    Renders the highlight box + tooltip for the given step, positioned
+    at/next to its resolved target (or centered if the target can't be
+    found). Pair this with real st.button calls right after for
+    Next/Back/Skip.
 
     `steps` is a pathway's step list from ui/tutorial_content.py's
     PATHWAYS -- each step must have "title", "body", and "target" keys.
@@ -174,18 +146,27 @@ def render_tutorial_overlay(steps: list, step_index: int):
             return null;
         }}
 
+        function positionHighlight(box, rect) {{
+            const pad = 6;
+            box.style.top = (rect.top - pad) + 'px';
+            box.style.left = (rect.left - pad) + 'px';
+            box.style.width = (rect.width + pad * 2) + 'px';
+            box.style.height = (rect.height + pad * 2) + 'px';
+        }}
+
         try {{
             const parentDoc = window.parent.document;
-
             ensureStylesInjected(parentDoc);
 
-            const existing = parentDoc.getElementById('tutorial-tooltip');
-            if (existing) existing.remove();
+            ['tutorial-tooltip', 'tutorial-highlight-box'].forEach(id => {{
+                const existing = parentDoc.getElementById(id);
+                if (existing) existing.remove();
+            }});
 
             const tooltip = parentDoc.createElement('div');
             tooltip.id = 'tutorial-tooltip';
             tooltip.innerHTML = `<h4>{title_js}</h4><p>{body_js}</p>
-                <div id="tutorial-step-count">Step {step_index + 1} of {len(steps)}</div>`;
+                <div id="tutorial-step-count">Step {step_index + 1} of {len(steps)} &mdash; look for the glowing box ⬇️</div>`;
 
             const target = resolveTarget(parentDoc, match);
 
@@ -198,17 +179,25 @@ def render_tutorial_overlay(steps: list, step_index: int):
                 return;
             }}
 
-            const rect = target.getBoundingClientRect();
-
-            const tooltipTop = (rect.bottom + 16 + 150 < window.innerHeight)
-                ? rect.bottom + 16
-                : Math.max(16, rect.top - 166);
-            tooltip.style.top = tooltipTop + 'px';
-            tooltip.style.left = Math.min(rect.left, window.innerWidth - 340) + 'px';
-
-            parentDoc.body.appendChild(tooltip);
-
             target.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
+
+            // Give the smooth-scroll a moment to finish before measuring
+            // and placing the highlight box + tooltip against real coords.
+            setTimeout(() => {{
+                const rect = target.getBoundingClientRect();
+
+                const box = parentDoc.createElement('div');
+                box.id = 'tutorial-highlight-box';
+                positionHighlight(box, rect);
+                parentDoc.body.appendChild(box);
+
+                const tooltipTop = (rect.bottom + 20 + 150 < window.innerHeight)
+                    ? rect.bottom + 20
+                    : Math.max(16, rect.top - 170);
+                tooltip.style.top = tooltipTop + 'px';
+                tooltip.style.left = Math.min(Math.max(16, rect.left), window.innerWidth - 340) + 'px';
+                parentDoc.body.appendChild(tooltip);
+            }}, 350);
         }} catch (e) {{
             console.warn('Tutorial overlay could not render:', e);
         }}
@@ -221,13 +210,13 @@ def render_tutorial_overlay(steps: list, step_index: int):
 def cleanup_tutorial_overlay():
     """
     Call this once when the tour ends (skip or finish) to remove any
-    leftover tooltip/style nodes from the parent document.
+    leftover tooltip/highlight/style nodes from the parent document.
     """
     html = """
     <script>
     try {
         const parentDoc = window.parent.document;
-        ['tutorial-tooltip', 'tutorial-overlay-styles'].forEach(id => {
+        ['tutorial-tooltip', 'tutorial-highlight-box', 'tutorial-overlay-styles'].forEach(id => {
             const el = parentDoc.getElementById(id);
             if (el) el.remove();
         });
