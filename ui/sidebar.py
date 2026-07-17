@@ -3,7 +3,6 @@ ui/sidebar.py
 =============
 Renders the sidebar: profile/logout, focus timer, subject/chapter
 workspace management (create/upload/delete), data source, and language.
-
 Returns a small dict of selections (active_subject, active_chapter,
 data_source, target_language) that the rest of the UI needs.
 
@@ -14,7 +13,18 @@ a Streamlit Cloud container restart. Logout now calls ui.auth.logout()
 so the bridge-issued auto-login token gets revoked, instead of just
 clearing session_state (which would leave a stale token in the URL
 that silently logs the user back in).
+
+CHANGED (upload flow clarity fix): the chapter uploader used to be
+rendered unconditionally, even before a subject existed or was
+selected — so a new user could try to upload before creating/picking
+a subject, and the file would silently get attributed to the literal
+"Select Subject" placeholder. The uploader (and chapter picker,
+delete controls, etc.) now only render once a real subject is
+selected, and inline st.info/st.caption hints spell out what to do
+next at every stage, so the sidebar is self-explanatory without
+needing to open the tutorial.
 """
+
 import base64
 
 import streamlit as st
@@ -41,17 +51,17 @@ from ui.auth import logout as auth_logout
 def _render_focus_timer(timer_mins: int):
     html_content = f"""
     <!DOCTYPE html><html><head><style>body {{ margin: 0; font-family: sans-serif; }}</style></head><body>
-        <div id="tD" style="font-size:30px; font-family:monospace; text-align:center; font-weight:bold; color:#333; background:#f0f2f6; border-radius:10px; padding:10px; margin-bottom:10px;">{timer_mins}:00</div>
-        <div style="text-align:center;">
-            <button onclick="sT()" style="padding:5px 15px; border:none; background:#4CAF50; color:white; border-radius:5px; cursor:pointer;">Start</button>
-            <button onclick="rT()" style="padding:5px 15px; border:none; background:#f44336; color:white; border-radius:5px; cursor:pointer;">Reset</button>
-        </div>
-        <script>
+    <div id="tD" style="font-size:30px; font-family:monospace; text-align:center; font-weight:bold; color:#333; background:#f0f2f6; border-radius:10px; padding:10px; margin-bottom:10px;">{timer_mins}:00</div>
+    <div style="text-align:center;">
+        <button onclick="sT()" style="padding:5px 15px; border:none; background:#4CAF50; color:white; border-radius:5px; cursor:pointer;">Start</button>
+        <button onclick="rT()" style="padding:5px 15px; border:none; background:#f44336; color:white; border-radius:5px; cursor:pointer;">Reset</button>
+    </div>
+    <script>
         let iv; let tl = {timer_mins * 60};
         function uD() {{ let m = Math.floor(tl / 60); let s = tl % 60; document.getElementById('tD').innerText = m + ":" + (s < 10 ? "0" : "") + s; }}
         function sT() {{ clearInterval(iv); iv = setInterval(() => {{ if(tl > 0) {{ tl--; uD(); }} else {{ clearInterval(iv); alert('Complete!'); }} }}, 1000); }}
         function rT() {{ clearInterval(iv); tl = {timer_mins * 60}; uD(); }}
-        </script>
+    </script>
     </body></html>
     """
     b64_html = base64.b64encode(html_content.encode("utf-8")).decode("utf-8")
@@ -100,6 +110,10 @@ def render_sidebar(username: str, user_paths: dict) -> dict:
             existing_subjects = []
             st.error("Could not load subjects — storage bridge is unreachable.")
 
+        # --- Empty-state guidance: no subjects yet -----------------------
+        if not existing_subjects:
+            st.info("👋 **Start here:** name a subject below (e.g. \"Biology\") and click Create.")
+
         # Fix Issue #13: Infinite rerun loop solved using a Form.
         with st.form("new_subject_form", clear_on_submit=True):
             new_subject = st.text_input("➕ Create New Subject")
@@ -114,8 +128,13 @@ def render_sidebar(username: str, user_paths: dict) -> dict:
 
         active_subject = st.selectbox("Select Subject", ["Select Subject"] + existing_subjects)
         active_chapter = "Select Chapter"
+        subject_files = []
 
-        if active_subject != "Select Subject":
+        # --- Everything chapter/upload-related now REQUIRES a subject ----
+        if active_subject == "Select Subject":
+            if existing_subjects:
+                st.caption("☝️ Select a subject above to upload material.")
+        else:
             try:
                 subject_files = list_subject_files(username, active_subject)
             except BridgeUnavailableError:
@@ -123,24 +142,36 @@ def render_sidebar(username: str, user_paths: dict) -> dict:
                 st.error("Could not load files for this subject — storage bridge is unreachable.")
 
             files = [f.rsplit(".", 1)[0] for f in subject_files if f.endswith((".txt", ".pdf"))]
+
+            if not files:
+                st.info(f"📄 **Next:** upload a PDF or TXT chapter to **{active_subject}** below.")
+
             active_chapter = st.selectbox("Active Chapter", ["Select Chapter"] + sorted(files))
 
             # Fix Issue #14: File uploader state control.
+            st.caption("Upload a chapter: choose a file, then click **Upload** to confirm.")
             with st.form("upload_form", clear_on_submit=True):
-                uploaded_file = st.file_uploader("Upload PDF or TXT", type=["pdf", "txt"], label_visibility="collapsed")
-                if st.form_submit_button("Upload"):
+                uploaded_file = st.file_uploader(
+                    "Upload PDF or TXT", type=["pdf", "txt"], label_visibility="collapsed"
+                )
+                if st.form_submit_button("Upload", use_container_width=True):
                     if uploaded_file is not None:
                         try:
                             stored_name = upload_subject_file(
-                                username, active_subject, uploaded_file.name, uploaded_file.getbuffer().tobytes()
+                                username, active_subject, uploaded_file.name,
+                                uploaded_file.getbuffer().tobytes()
                             )
                             get_vector_store(username, active_subject, force_rebuild=True)
                             st.success(f"Imported {stored_name}!")
                             st.rerun()
                         except BridgeUnavailableError:
                             st.error("Upload failed — storage bridge is unreachable. Please try again shortly.")
+                    else:
+                        st.warning("Choose a file first, then click Upload.")
 
             if active_chapter != "Select Chapter":
+                st.success(f"✅ Active chapter: **{active_chapter}** — head to the Tutor or Study tab to begin.")
+
                 with st.popover("🗑️ Delete Selected Chapter", use_container_width=True):
                     st.warning(f"Delete **{active_chapter}** and all its quizzes, flashcards, and study guides? This can't be undone.")
                     if st.button("Confirm delete chapter", type="primary", key="confirm_delete_chapter"):
@@ -149,9 +180,7 @@ def render_sidebar(username: str, user_paths: dict) -> dict:
                                 candidate = active_chapter + ext
                                 if candidate in subject_files:
                                     delete_subject_file(username, active_subject, candidate)
-
                             delete_chapter_local_content(username, active_subject, active_chapter)
-
                             # Fix Issue #37: Rebuild vector db when files are deleted.
                             get_vector_store(username, active_subject, force_rebuild=True)
                             st.rerun()
@@ -189,9 +218,9 @@ def render_sidebar(username: str, user_paths: dict) -> dict:
         data_source = st.radio("Data Source:", DATA_SOURCES)
         target_language = st.selectbox("Target Language:", LANGUAGES)
 
-    return {
-        "active_subject": active_subject,
-        "active_chapter": active_chapter,
-        "data_source": data_source,
-        "target_language": target_language,
-    }
+        return {
+            "active_subject": active_subject,
+            "active_chapter": active_chapter,
+            "data_source": data_source,
+            "target_language": target_language,
+        }
