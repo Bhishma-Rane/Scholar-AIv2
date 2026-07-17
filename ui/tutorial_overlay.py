@@ -166,7 +166,7 @@ def render_tutorial_overlay(steps: list, step_index: int):
             const tooltip = parentDoc.createElement('div');
             tooltip.id = 'tutorial-tooltip';
             tooltip.innerHTML = `<h4>{title_js}</h4><p>{body_js}</p>
-                <div id="tutorial-step-count">Step {step_index + 1} of {len(steps)} &mdash; look for the glowing box ⬇️</div>`;
+                <div id="tutorial-step-count">Look for the glowing box ⬇️</div>`;
 
             const target = resolveTarget(parentDoc, match);
 
