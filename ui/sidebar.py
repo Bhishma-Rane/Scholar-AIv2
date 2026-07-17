@@ -148,26 +148,38 @@ def render_sidebar(username: str, user_paths: dict) -> dict:
 
             active_chapter = st.selectbox("Active Chapter", ["Select Chapter"] + sorted(files))
 
-            # Fix Issue #14: File uploader state control.
-            st.caption("Upload a chapter: choose a file, then click **Upload** to confirm.")
-            with st.form("upload_form", clear_on_submit=True):
-                uploaded_file = st.file_uploader(
-                    "Upload PDF or TXT", type=["pdf", "txt"], label_visibility="collapsed"
-                )
-                if st.form_submit_button("Upload", use_container_width=True):
-                    if uploaded_file is not None:
-                        try:
-                            stored_name = upload_subject_file(
-                                username, active_subject, uploaded_file.name,
-                                uploaded_file.getbuffer().tobytes()
-                            )
-                            get_vector_store(username, active_subject, force_rebuild=True)
-                            st.success(f"Imported {stored_name}!")
-                            st.rerun()
-                        except BridgeUnavailableError:
-                            st.error("Upload failed — storage bridge is unreachable. Please try again shortly.")
-                    else:
-                        st.warning("Choose a file first, then click Upload.")
+            # Fix Issue #14 (revised): auto-upload on file selection.
+            # Previously this was a form with the native file_uploader's
+            # own "Browse files" button PLUS a separate "Upload" submit
+            # button below it -- two clickable controls for one action,
+            # and people were leaving without ever clicking the second
+            # one. There's now only the single native picker; selecting
+            # a file immediately triggers the upload, no second click.
+            st.caption(f"Upload a chapter to **{active_subject}** (PDF or TXT):")
+            # A counter-suffixed key lets us force-reset the widget after
+            # a successful upload (Streamlit has no other way to clear a
+            # file_uploader's selection outside a form) so it goes back
+            # to empty instead of showing the just-uploaded file forever.
+            uploader_gen_key = f"uploader_gen_{active_subject}"
+            uploader_gen = st.session_state.get(uploader_gen_key, 0)
+            uploaded_file = st.file_uploader(
+                "Upload PDF or TXT",
+                type=["pdf", "txt"],
+                label_visibility="collapsed",
+                key=f"uploader_{active_subject}_{uploader_gen}",
+            )
+            if uploaded_file is not None:
+                try:
+                    stored_name = upload_subject_file(
+                        username, active_subject, uploaded_file.name,
+                        uploaded_file.getbuffer().tobytes()
+                    )
+                    get_vector_store(username, active_subject, force_rebuild=True)
+                    st.session_state[uploader_gen_key] = uploader_gen + 1
+                    st.success(f"Imported {stored_name}!")
+                    st.rerun()
+                except BridgeUnavailableError:
+                    st.error("Upload failed — storage bridge is unreachable. Please try again shortly.")
 
             if active_chapter != "Select Chapter":
                 st.success(f"✅ Active chapter: **{active_chapter}** — head to the Tutor or Study tab to begin.")
