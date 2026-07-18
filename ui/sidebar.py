@@ -1,28 +1,13 @@
 """
 ui/sidebar.py
 =============
-Renders the sidebar: profile/logout, focus timer, subject/chapter
-workspace management (create/upload/delete), data source, and language.
-Returns a small dict of selections (active_subject, active_chapter,
-data_source, target_language) that the rest of the UI needs.
+Renders the sidebar: profile/logout, focus timer, data source, and
+language. Subject/chapter workspace management (create/upload/delete)
+moved to ui/tab_workspace.py so it's a guided first tab instead of a
+cramped sidebar section.
 
-CHANGED: subject creation, file upload, file listing, and delete all
-go through the storage bridge now (core/paths.py's bridge-backed
-helpers) instead of local disk — so subjects and uploaded PDFs survive
-a Streamlit Cloud container restart. Logout now calls ui.auth.logout()
-so the bridge-issued auto-login token gets revoked, instead of just
-clearing session_state (which would leave a stale token in the URL
-that silently logs the user back in).
-
-CHANGED (upload flow clarity fix): the chapter uploader used to be
-rendered unconditionally, even before a subject existed or was
-selected — so a new user could try to upload before creating/picking
-a subject, and the file would silently get attributed to the literal
-"Select Subject" placeholder. The uploader (and chapter picker,
-delete controls, etc.) now only render once a real subject is
-selected, and inline st.info/st.caption hints spell out what to do
-next at every stage, so the sidebar is self-explanatory without
-needing to open the tutorial.
+Returns a small dict of selections (data_source, target_language) that
+the rest of the UI needs.
 """
 
 import base64
@@ -30,20 +15,6 @@ import base64
 import streamlit as st
 
 from config import DATA_SOURCES, LANGUAGES
-from core.paths import (
-    get_user_paths,
-    sanitize_filename,
-    list_subjects,
-    create_subject,
-    list_subject_files,
-    upload_subject_file,
-    delete_subject_file,
-    delete_subject_remote,
-    delete_chapter_local_content,
-    delete_subject_local_content,
-)
-from core.bridge_client import BridgeUnavailableError, is_bridge_reachable
-from core.vectorstore import get_vector_store
 from core.onboarding_store import reset_tutorial
 from ui.auth import logout as auth_logout
 
@@ -71,18 +42,11 @@ def _render_focus_timer(timer_mins: int):
     )
 
 
-def render_sidebar(username: str, user_paths: dict) -> dict:
+def render_sidebar(username: str) -> dict:
     with st.sidebar:
         st.title("🎓 ScholarAI")
         st.caption("*Learn. Understand. Master.*")
         st.caption(f"👤 Profile: **{username.capitalize()}**")
-
-        if not is_bridge_reachable():
-            st.warning(
-                "⚠️ Storage bridge unreachable — subjects/files may not load or save. "
-                "Check that the bridge server and its ngrok tunnel are running.",
-                icon="⚠️",
-            )
 
         col_logout, col_tutorial = st.columns(2)
         with col_logout:
@@ -102,137 +66,10 @@ def render_sidebar(username: str, user_paths: dict) -> dict:
         _render_focus_timer(timer_mins)
 
         st.markdown("---")
-        st.subheader("📁 Subject Workspace")
-
-        try:
-            existing_subjects = list_subjects(username)
-        except BridgeUnavailableError:
-            existing_subjects = []
-            st.error("Could not load subjects — storage bridge is unreachable.")
-
-        # --- Empty-state guidance: no subjects yet -----------------------
-        if not existing_subjects:
-            st.info("👋 **Start here:** name a subject below (e.g. \"Biology\") and click Create.")
-
-        # Fix Issue #13: Infinite rerun loop solved using a Form.
-        with st.form("new_subject_form", clear_on_submit=True):
-            new_subject = st.text_input("➕ Create New Subject")
-            if st.form_submit_button("Create"):
-                if new_subject.strip():
-                    clean_sub = sanitize_filename(new_subject)
-                    try:
-                        create_subject(username, clean_sub)
-                        st.rerun()
-                    except BridgeUnavailableError:
-                        st.error("Could not create subject — storage bridge is unreachable.")
-
-        active_subject = st.selectbox("Select Subject", ["Select Subject"] + existing_subjects)
-        active_chapter = "Select Chapter"
-        subject_files = []
-
-        # --- Everything chapter/upload-related now REQUIRES a subject ----
-        if active_subject == "Select Subject":
-            if existing_subjects:
-                st.caption("☝️ Select a subject above to upload material.")
-        else:
-            try:
-                subject_files = list_subject_files(username, active_subject)
-            except BridgeUnavailableError:
-                subject_files = []
-                st.error("Could not load files for this subject — storage bridge is unreachable.")
-
-            files = [f.rsplit(".", 1)[0] for f in subject_files if f.endswith((".txt", ".pdf"))]
-
-            if not files:
-                st.info(f"📄 **Next:** upload a PDF or TXT chapter to **{active_subject}** below.")
-
-            active_chapter = st.selectbox("Active Chapter", ["Select Chapter"] + sorted(files))
-
-            # Fix Issue #14 (revised): auto-upload on file selection.
-            # Previously this was a form with the native file_uploader's
-            # own "Browse files" button PLUS a separate "Upload" submit
-            # button below it -- two clickable controls for one action,
-            # and people were leaving without ever clicking the second
-            # one. There's now only the single native picker; selecting
-            # a file immediately triggers the upload, no second click.
-            st.caption(f"Upload a chapter to **{active_subject}** (PDF or TXT):")
-            # A counter-suffixed key lets us force-reset the widget after
-            # a successful upload (Streamlit has no other way to clear a
-            # file_uploader's selection outside a form) so it goes back
-            # to empty instead of showing the just-uploaded file forever.
-            uploader_gen_key = f"uploader_gen_{active_subject}"
-            uploader_gen = st.session_state.get(uploader_gen_key, 0)
-            uploaded_file = st.file_uploader(
-                "Upload PDF or TXT",
-                type=["pdf", "txt"],
-                label_visibility="collapsed",
-                key=f"uploader_{active_subject}_{uploader_gen}",
-            )
-            if uploaded_file is not None:
-                try:
-                    stored_name = upload_subject_file(
-                        username, active_subject, uploaded_file.name,
-                        uploaded_file.getbuffer().tobytes()
-                    )
-                    get_vector_store(username, active_subject, force_rebuild=True)
-                    st.session_state[uploader_gen_key] = uploader_gen + 1
-                    st.success(f"Imported {stored_name}!")
-                    st.rerun()
-                except BridgeUnavailableError:
-                    st.error("Upload failed — storage bridge is unreachable. Please try again shortly.")
-
-            if active_chapter != "Select Chapter":
-                st.success(f"✅ Active chapter: **{active_chapter}** — head to the Tutor or Study tab to begin.")
-
-                with st.popover("🗑️ Delete Selected Chapter", use_container_width=True):
-                    st.warning(f"Delete **{active_chapter}** and all its quizzes, flashcards, and study guides? This can't be undone.")
-                    if st.button("Confirm delete chapter", type="primary", key="confirm_delete_chapter"):
-                        try:
-                            for ext in [".txt", ".pdf"]:
-                                candidate = active_chapter + ext
-                                if candidate in subject_files:
-                                    delete_subject_file(username, active_subject, candidate)
-                            delete_chapter_local_content(username, active_subject, active_chapter)
-                            # Fix Issue #37: Rebuild vector db when files are deleted.
-                            get_vector_store(username, active_subject, force_rebuild=True)
-                            st.rerun()
-                        except BridgeUnavailableError:
-                            st.error("Delete failed — storage bridge is unreachable. Please try again shortly.")
-
-            # ------------------------------------------------------------
-            # Delete Entire Subject — higher blast radius than a chapter
-            # delete (every chapter, file, and generated study item under
-            # it), so this asks the person to type the subject name back
-            # rather than just clicking a button, to guard against a
-            # misclick nuking an entire subject by accident.
-            # ------------------------------------------------------------
-            with st.popover("🗑️ Delete Entire Subject", use_container_width=True):
-                st.error(
-                    f"This permanently deletes **{active_subject}** — every chapter, uploaded file, "
-                    f"quiz, flashcard deck, and study guide under it. This cannot be undone."
-                )
-                typed_subject = st.text_input(
-                    f"Type \"{active_subject}\" to confirm:", key="confirm_delete_subject_text"
-                )
-                if st.button("Confirm delete subject", type="primary", key="confirm_delete_subject_btn"):
-                    if typed_subject.strip() != active_subject:
-                        st.error("That doesn't match the subject name. Nothing was deleted.")
-                    else:
-                        try:
-                            delete_subject_remote(username, active_subject)
-                            delete_subject_local_content(username, active_subject)
-                            st.success(f"Deleted subject \"{active_subject}\".")
-                            st.rerun()
-                        except BridgeUnavailableError:
-                            st.error("Delete failed — storage bridge is unreachable. Please try again shortly.")
-
-        st.markdown("---")
         data_source = st.radio("Data Source:", DATA_SOURCES)
         target_language = st.selectbox("Target Language:", LANGUAGES)
 
         return {
-            "active_subject": active_subject,
-            "active_chapter": active_chapter,
             "data_source": data_source,
             "target_language": target_language,
         }
