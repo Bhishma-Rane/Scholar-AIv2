@@ -1,38 +1,29 @@
 """
 app.py
-=======
+======
 ScholarAI by AuraStudios — "Learn. Understand. Master."
 Streamlit entry point.
+
 This file only orchestrates: page setup, session state, login, the
 first-run tutorial gate, sidebar, and tab dispatch. All actual logic
 lives in core/, features/, and ui/. Run with:
-    streamlit run app.py
-RESTRUCTURED: down from 11 tabs to 6, based on user feedback that the
-old layout was overwhelming.
-  - Study Tools + Flashcards + Viewer -> combined into "Study"
-  - Assessment + Batch Gen (quiz half) + Question Paper -> combined into
-    "Practice & Exams" (Batch Gen's old mock-exam-paper generation mode
-    is REMOVED -- Question Paper replaces it entirely)
-  - Tutorial -> no longer a top-level tab; replay it from Settings
-    instead (most people were skipping the always-visible tab)
-  - Feedback -> no longer a tab; now a small popover button in the
-    header instead, so it doesn't eat a tab slot
-  - NEW: Settings tab (account info, accent color picker, tutorial replay)
 
-FIRST-RUN TUTORIAL: the real app (sidebar + tabs) is now ALWAYS
-rendered, even for first-run users. The welcome/pathway-picker shows as
-a real Streamlit modal (st.dialog) on top of it via render_first_run_gate(),
-and the spotlight walkthrough that follows (render_tutorial_overlay_if_active)
-draws over the real, live, already-rendered app. Previously this gate
-replaced the app entirely and called st.stop(), which left the
-walkthrough with no real elements to spotlight.
+    streamlit run app.py
+
+UPDATED: subject/chapter/upload management moved out of the sidebar and
+into a new "📁 Workspace" tab — now the FIRST tab, so setup is the first
+thing a user sees and does, with clear step-by-step instructions,
+instead of being buried in a cramped sidebar section.
 """
+
 import streamlit as st
+
 from config import configure_page, init_session_state, inject_css, render_brand_header, DEFAULT_THEME_COLOR
 from core.paths import get_user_paths
 from core.bridge_client import get_theme_color, BridgeUnavailableError
 from ui.auth import require_login
 from ui.sidebar import render_sidebar
+from ui.tab_workspace import render_workspace_tab
 from ui.tab_tutorial import render_first_run_gate, render_tutorial_overlay_if_active
 from ui.tab_dashboard import render_dashboard_tab
 from ui.tab_chat import render_chat_tab
@@ -44,6 +35,7 @@ from ui.feedback_widget import render_feedback_widget
 
 configure_page()
 init_session_state()
+
 username = require_login()
 user_paths = get_user_paths(username)
 
@@ -61,14 +53,13 @@ _, feedback_col = st.columns([6, 1])
 with feedback_col:
     render_feedback_widget(username)
 
-selections = render_sidebar(username, user_paths)
-active_subject = selections["active_subject"]
-active_chapter = selections["active_chapter"]
-data_source = selections["data_source"]
-target_language = selections["target_language"]
+sidebar_selections = render_sidebar(username)
+data_source = sidebar_selections["data_source"]
+target_language = sidebar_selections["target_language"]
 
-tab_dashboard, tab_chat, tab_study, tab_practice, tab_progress, tab_settings = st.tabs(
+tab_workspace, tab_dashboard, tab_chat, tab_study, tab_practice, tab_progress, tab_settings = st.tabs(
     [
+        "📁 Workspace",
         "🤖 Dashboard",
         "💬 Tutor",
         "📚 Study",
@@ -78,16 +69,27 @@ tab_dashboard, tab_chat, tab_study, tab_practice, tab_progress, tab_settings = s
     ]
 )
 
+with tab_workspace:
+    workspace_selections = render_workspace_tab(username, user_paths)
+
+active_subject = workspace_selections["active_subject"]
+active_chapter = workspace_selections["active_chapter"]
+
 with tab_dashboard:
     render_dashboard_tab(username, active_subject, target_language)
+
 with tab_chat:
     render_chat_tab(username, active_subject, active_chapter, data_source, target_language)
+
 with tab_study:
     render_study_tab(username, active_subject, active_chapter, target_language)
+
 with tab_practice:
     render_practice_tab(username, active_subject, active_chapter, target_language)
+
 with tab_progress:
     render_progress_tab(username, active_subject)
+
 with tab_settings:
     render_settings_tab(username)
 
