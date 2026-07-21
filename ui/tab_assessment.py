@@ -8,19 +8,16 @@ by AI comparison against the answer key (with partial credit). Supports
 an optional negative-marking toggle. Results feed into the analytics store
 so the Dashboard and Progress tabs have real data to show.
 """
-import os
-import json
-
 import streamlit as st
 
-from core.paths import get_chapter_paths
+from core.content_store import exists as content_exists, load_json
 from core.analytics_store import record_quiz_attempt
 from features.mock_exams import grade_full_quiz
 from ui.common_styles import inject_quiz_css
 
 
-def _render_setup_screen(username: str, active_subject: str, active_chapter: str, data_file: str):
-    if os.path.exists(data_file):
+def _render_setup_screen(username: str, active_subject: str, active_chapter: str):
+    if content_exists(username, active_subject, active_chapter, "mcq", f"{active_chapter}_Data.json"):
         st.session_state.negative_marking_enabled = st.toggle(
             "Enable Negative Marking",
             value=st.session_state.get("negative_marking_enabled", False),
@@ -29,8 +26,7 @@ def _render_setup_screen(username: str, active_subject: str, active_chapter: str
         )
         if st.button("▶ Load Evaluation Engine", type="primary"):
             try:
-                with open(data_file, "r", encoding="utf-8") as f:
-                    quiz_data = json.load(f)
+                quiz_data = load_json(username, active_subject, active_chapter, "mcq", f"{active_chapter}_Data.json")
                 st.session_state.update(
                     {
                         "quiz_data": quiz_data,
@@ -144,11 +140,8 @@ def render_assessment_tab(username: str, active_subject: str, active_chapter: st
     if "grading_result" not in st.session_state:
         st.session_state.grading_result = None
 
-    paths = get_chapter_paths(username, active_subject, active_chapter)
-    data_file = os.path.join(paths["mcq"], f"{active_chapter}_Data.json")
-
     if not st.session_state.quiz_active:
-        _render_setup_screen(username, active_subject, active_chapter, data_file)
+        _render_setup_screen(username, active_subject, active_chapter)
     elif not st.session_state.exam_submitted:
         _render_question_screen()
     else:
