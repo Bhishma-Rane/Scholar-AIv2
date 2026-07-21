@@ -1,17 +1,20 @@
 """
 ui/tab_tools.py
 ================
+NOTE: superseded by ui/tab_study.py (see that file's docstring) -- this
+module is not imported or wired into the app anymore. Left in the repo
+for reference; updated below only so it doesn't silently break if it's
+ever revived, not because it's part of the live app.
+
 The "Study Tools" tab: on-demand study material generation (roadmaps,
 summaries, cheat sheets, formula sheets, vocabulary builder), the
 Concept Map (rendered as labeled images, one per key concept, via web
 image search), Daily Learning Goals (a simple checklist), and the AI
 Mistake Notebook profile viewer.
 """
-import os
-
 import streamlit as st
 
-from core.paths import get_chapter_paths
+from core.content_store import load_text, delete as delete_content
 from core.llm import search_images
 from core.analytics_store import record_study_activity
 from features.study_materials import (
@@ -19,6 +22,7 @@ from features.study_materials import (
     generate_study_material,
     generate_concept_map,
     generate_daily_goals,
+    GUIDES_CATEGORY,
 )
 
 
@@ -111,19 +115,14 @@ def render_tools_tab(username: str, active_subject: str, active_chapter: str, ta
 
     with mistakes_tab:
         if active_chapter != "Select Chapter" and active_subject != "Select Subject":
-            paths = get_chapter_paths(username, active_subject, active_chapter)
-            profile_file = os.path.join(paths["guides"], "Mistake_Notebook_Profile.txt")
-            if os.path.exists(profile_file):
-                with open(profile_file, "r", encoding="utf-8", errors="replace") as f:
-                    profile_data = f.read()
-                if profile_data.strip():
-                    st.markdown(profile_data)
-                    if st.button("🗑️ Reset Profile"):
-                        open(profile_file, "w").close()
-                        st.rerun()
-                else:
-                    st.info("Profile is empty. Take a test to build it!")
+            profile_data = load_text(username, active_subject, active_chapter, GUIDES_CATEGORY, "Mistake_Notebook_Profile.txt")
+            if profile_data and profile_data.strip():
+                st.markdown(profile_data)
+                if st.button("🗑️ Reset Profile"):
+                    delete_content(username, active_subject, active_chapter, GUIDES_CATEGORY, "Mistake_Notebook_Profile.txt")
+                    st.rerun()
             else:
                 st.info("Profile is empty. Take a test to build it!")
         else:
             st.warning("Select an Active Chapter.")
+            
