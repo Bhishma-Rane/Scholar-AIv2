@@ -139,7 +139,7 @@ def render_workspace_tab(username: str, user_paths: dict) -> dict:
     # ------------------------------------------------------------
     st.subheader("Step 4 · Next steps from here")
     st.caption(
-        "Go on! Try to generate some study materials in the Study/Generate tab!"
+        "Go on! Try to generate some study materials in the **Study/Generate** tab!"
     )
 
     st.markdown("---")
