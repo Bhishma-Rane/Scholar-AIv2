@@ -7,12 +7,21 @@ and streak data. Every feature that produces a gradeable or trackable
 event (quiz submission, flashcard review, study session) should call into
 this module so the analytics layer has one consistent place to read from.
 
-Storage: one JSON file per user, at
-    users/<username>/analytics.json
-Small enough that JSON is appropriate (mirrors the existing _credentials.json
-pattern); no new infra needed.
+Storage: ONE BLOB PER USER on the storage bridge (see core/bridge_client.py
+and storage_bridge.py's /blobs/* routes), under the key "analytics".
 
-Schema:
+CHANGED: this used to write one JSON file per user to local disk
+(users/<username>/analytics.json). That worked fine on Bhishma's own
+machine, but Streamlit Cloud's container filesystem is ephemeral --
+wiped on every restart/redeploy -- so streak and Progress & Analytics
+data was silently lost, often showing a 0/1-day streak even for
+students who'd been studying for weeks. This mirrors the same fix
+already applied to subjects/uploaded files: move it onto the bridge,
+which persists on Bhishma's own machine indefinitely. The in-memory
+schema and every public function's signature are unchanged, so nothing
+calling into this module needs to change.
+
+Schema (same as before, just stored remotely now):
 {
   "quiz_attempts": [
       {
@@ -37,16 +46,12 @@ Schema:
   "streak": {"current_streak_days": 4, "last_study_date": "2026-06-19", "longest_streak_days": 9}
 }
 """
-import os
 import json
 from datetime import datetime, date, timedelta
 
-from core.paths import get_user_paths
+from core import bridge_client
 
-
-def _store_path(username: str) -> str:
-    paths = get_user_paths(username)
-    return os.path.join(paths["root"], "analytics.json")
+_BLOB_KEY = "analytics"
 
 
 def _default_store() -> dict:
@@ -60,28 +65,22 @@ def _default_store() -> dict:
 
 
 def _load(username: str) -> dict:
-    path = _store_path(username)
-    if not os.path.exists(path):
+    raw = bridge_client.blob_get(username, _BLOB_KEY)
+    if raw is None:
         return _default_store()
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        data = json.loads(raw)
         # Backfill any keys missing from an older schema version.
         defaults = _default_store()
         for key, val in defaults.items():
             data.setdefault(key, val)
         return data
-    except (json.JSONDecodeError, OSError):
+    except (json.JSONDecodeError, TypeError):
         return _default_store()
 
 
 def _save(username: str, data: dict) -> None:
-    path = _store_path(username)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp_path = path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp_path, path)
+    bridge_client.blob_set(username, _BLOB_KEY, json.dumps(data))
 
 
 def _topic_key(subject: str, chapter: str, topic: str = None) -> str:
