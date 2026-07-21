@@ -20,18 +20,17 @@ exist in ui/tab_flashcards.py and ui/tab_viewer.py respectively -- it
 imports and calls them as-is, just nested under a sub-tab instead of a
 top-level tab. No changes needed to those two files.
 """
-import os
-
 import streamlit as st
 
-from core.paths import get_chapter_paths
 from core.llm import search_images
 from core.analytics_store import record_study_activity
+from core.content_store import list_category, load_text, delete as delete_content
 from features.study_materials import (
     MATERIAL_PROMPTS,
     generate_study_material,
     generate_concept_map,
     generate_daily_goals,
+    GUIDES_CATEGORY,
 )
 from ui.tab_flashcards import render_flashcards_tab
 from ui.tab_viewer import render_viewer_tab
@@ -111,12 +110,10 @@ def _render_daily_goals(username: str, active_subject: str, active_chapter: str,
 def _render_manage_materials(username: str, active_subject: str, active_chapter: str):
     if active_chapter == "Select Chapter" or active_subject == "Select Subject":
         return
-    paths = get_chapter_paths(username, active_subject, active_chapter)
-    guides_dir = paths["guides"]
     existing = sorted(
-        f for f in os.listdir(guides_dir)
+        f for f in list_category(username, active_subject, active_chapter, GUIDES_CATEGORY)
         if f.endswith(".txt") and f != "Mistake_Notebook_Profile.txt"
-    ) if os.path.isdir(guides_dir) else []
+    )
 
     if not existing:
         return
@@ -127,7 +124,7 @@ def _render_manage_materials(username: str, active_subject: str, active_chapter:
             col1, col2 = st.columns([4, 1])
             col1.write(label)
             if col2.button("Delete", key=f"del_material_{fname}"):
-                os.remove(os.path.join(guides_dir, fname))
+                delete_content(username, active_subject, active_chapter, GUIDES_CATEGORY, fname)
                 st.rerun()
 
 
@@ -152,18 +149,12 @@ def _render_generate_subtab(username: str, active_subject: str, active_chapter: 
 
 def _render_mistake_notebook(username: str, active_subject: str, active_chapter: str):
     if active_chapter != "Select Chapter" and active_subject != "Select Subject":
-        paths = get_chapter_paths(username, active_subject, active_chapter)
-        profile_file = os.path.join(paths["guides"], "Mistake_Notebook_Profile.txt")
-        if os.path.exists(profile_file):
-            with open(profile_file, "r", encoding="utf-8", errors="replace") as f:
-                profile_data = f.read()
-            if profile_data.strip():
-                st.markdown(profile_data)
-                if st.button("🗑️ Reset Profile"):
-                    open(profile_file, "w").close()
-                    st.rerun()
-            else:
-                st.info("Profile is empty. Take a test to build it!")
+        profile_data = load_text(username, active_subject, active_chapter, GUIDES_CATEGORY, "Mistake_Notebook_Profile.txt")
+        if profile_data and profile_data.strip():
+            st.markdown(profile_data)
+            if st.button("🗑️ Reset Profile"):
+                delete_content(username, active_subject, active_chapter, GUIDES_CATEGORY, "Mistake_Notebook_Profile.txt")
+                st.rerun()
         else:
             st.info("Profile is empty. Take a test to build it!")
     else:
