@@ -45,8 +45,10 @@ from typing import List
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from core.llm import get_llm
-from core.paths import get_chapter_paths
+from core.content_store import save_text
 from core.vectorstore import get_chapter_text
+
+MOCK_CATEGORY = "mock"
 
 
 def grade_objective_answer(question: dict, user_answer) -> dict:
@@ -222,9 +224,8 @@ def build_mock_exam_paper(username: str, subject: str, chapter: str, config: dic
     """
     Builds a custom printable mock exam (question paper + master answer key)
     based on the requested section order and per-section question counts.
-    Writes both files to the chapter's "mock" folder.
+    Saves both via core.content_store (bridge-backed) under the "mock" category.
     """
-    paths = get_chapter_paths(username, subject, chapter)
     exact_text = get_chapter_text(username, subject, chapter)
     if not exact_text:
         raise FileNotFoundError("Chapter text not found.")
@@ -281,11 +282,8 @@ def build_mock_exam_paper(username: str, subject: str, chapter: str, config: dic
             )
             a_paper += quiz_llm.invoke(a_prompt).content + "\n\n"
 
-    with open(f"{paths['mock']}/{chapter}_MockExam_Questions.txt", "w", encoding="utf-8") as f:
-        f.write(q_paper)
-
-    with open(f"{paths['mock']}/{chapter}_MockExam_Answers.txt", "w", encoding="utf-8") as f:
-        f.write(a_paper)
+    save_text(username, subject, chapter, MOCK_CATEGORY, f"{chapter}_MockExam_Questions.txt", q_paper)
+    save_text(username, subject, chapter, MOCK_CATEGORY, f"{chapter}_MockExam_Answers.txt", a_paper)
 
 
 def generate_performance_summary(wrong_answers: List[dict], subjective_answers: List[dict],
