@@ -63,6 +63,8 @@ purely about HTTP transport to the bridge; file-system/path helpers
 and document-loading logic (get_chapter_text, etc.) belong in
 core/vectorstore.py, not here.
 """
+from typing import Optional
+
 import requests
 
 from config import BRIDGE_BASE_URL, BRIDGE_SHARED_SECRET
@@ -542,3 +544,38 @@ def get_tutorial_completed(username: str) -> bool:
 
 def set_tutorial_completed(username: str, completed: bool) -> None:
     _post("/users/tutorial_completed", json={"username": username, "completed": completed})
+
+
+# ---------------------------------------------------------------------
+# Generic blob storage -- used for anything that used to live only on
+# Streamlit Cloud's local container disk and got wiped on every
+# restart/redeploy: analytics.json (quiz history, topic mastery,
+# streak; see core/analytics_store.py) and generated study content
+# (flashcards, study guides, mock exams, MCQ decks; see
+# core/content_store.py). Values are plain strings -- callers handle
+# their own JSON encoding/decoding.
+# ---------------------------------------------------------------------
+def blob_set(username: str, key: str, value: str) -> None:
+    _post("/blobs/set", json={"username": username, "key": key, "value": value})
+
+
+def blob_get(username: str, key: str) -> Optional[str]:
+    """Returns the stored value, or None if this key has never been set."""
+    result = _get("/blobs/get", params={"username": username, "key": key})
+    return result["value"] if result.get("found") else None
+
+
+def blob_list(username: str, prefix: str = "") -> list:
+    """Returns all keys for this user starting with `prefix` (empty = every key)."""
+    result = _get("/blobs/list", params={"username": username, "prefix": prefix})
+    return result.get("keys", [])
+
+
+def blob_delete(username: str, key: str) -> None:
+    _post("/blobs/delete", json={"username": username, "key": key})
+
+
+def blob_delete_prefix(username: str, prefix: str) -> None:
+    """Deletes every blob whose key starts with `prefix` for this user --
+    e.g. wiping all generated content for one chapter or subject at once."""
+    _post("/blobs/delete_prefix", json={"username": username, "prefix": prefix})
