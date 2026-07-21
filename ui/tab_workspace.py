@@ -135,6 +135,17 @@ def render_workspace_tab(username: str, user_paths: dict) -> dict:
     st.markdown("---")
 
     # ------------------------------------------------------------
+    # Step 4 — Next Step
+    # ------------------------------------------------------------
+    st.subheader("Step 4 · Next steps from here")
+    st.caption(
+        "Whichever chapter is selected here is what the Tutor, Study, and "
+        "Go on! Try to generate some study materials in the Study/Generate tab!"
+    )
+
+    st.markdown("---")
+
+    # ------------------------------------------------------------
     # Danger zone — delete chapter / subject
     # ------------------------------------------------------------
     st.subheader("⚠️ Danger zone")
