@@ -20,31 +20,32 @@ REPLACES the old split across three tabs:
     admin-published list, so it needs active_subject/active_chapter
     passed through in addition to username/target_language.
 """
-import os
-import json
-
 import streamlit as st
 
-from core.paths import get_chapter_paths
+from core.content_store import exists as content_exists, load_json, delete as delete_content
 from core.analytics_store import record_quiz_attempt
 from features.mock_exams import grade_full_quiz
 from features.chat_graph import vedic_graph
 from ui.tab_question_paper import render_question_paper_tab
 from ui.common_styles import inject_quiz_css
 
+MCQ_CATEGORY = "mcq"
+
+
+def _quiz_filename(active_chapter: str) -> str:
+    return f"{active_chapter}_Data.json"
+
 
 def _render_generate_quiz_subtab(username: str, active_subject: str, active_chapter: str, target_language: str):
     st.caption("Generate a digital, auto-graded quiz from this chapter — then take it in the next sub-tab.")
 
     if active_chapter != "Select Chapter":
-        paths = get_chapter_paths(username, active_subject, active_chapter)
-        data_file = os.path.join(paths["mcq"], f"{active_chapter}_Data.json")
-        if os.path.exists(data_file):
+        if content_exists(username, active_subject, active_chapter, MCQ_CATEGORY, _quiz_filename(active_chapter)):
             st.info(f"A quiz already exists for **{active_chapter}**. Generating again will overwrite it.")
             with st.popover("🗑️ Delete This Quiz"):
                 st.warning("This deletes the generated quiz for this chapter. It can't be undone.")
                 if st.button("Confirm delete quiz", type="primary", key="delete_quiz_confirm"):
-                    os.remove(data_file)
+                    delete_content(username, active_subject, active_chapter, MCQ_CATEGORY, _quiz_filename(active_chapter))
                     st.success("Quiz deleted.")
                     st.rerun()
 
@@ -79,8 +80,8 @@ def _render_generate_quiz_subtab(username: str, active_subject: str, active_chap
                 st.error(res["response"])
 
 
-def _render_quiz_setup_screen(username: str, active_subject: str, active_chapter: str, data_file: str):
-    if os.path.exists(data_file):
+def _render_quiz_setup_screen(username: str, active_subject: str, active_chapter: str):
+    if content_exists(username, active_subject, active_chapter, MCQ_CATEGORY, _quiz_filename(active_chapter)):
         st.session_state.negative_marking_enabled = st.toggle(
             "Enable Negative Marking",
             value=st.session_state.get("negative_marking_enabled", False),
@@ -89,8 +90,7 @@ def _render_quiz_setup_screen(username: str, active_subject: str, active_chapter
         )
         if st.button("▶ Load Evaluation Engine", type="primary"):
             try:
-                with open(data_file, "r", encoding="utf-8") as f:
-                    quiz_data = json.load(f)
+                quiz_data = load_json(username, active_subject, active_chapter, MCQ_CATEGORY, _quiz_filename(active_chapter))
                 st.session_state.update(
                     {
                         "quiz_data": quiz_data,
@@ -201,11 +201,8 @@ def _render_take_quiz_subtab(username: str, active_subject: str, active_chapter:
     if "grading_result" not in st.session_state:
         st.session_state.grading_result = None
 
-    paths = get_chapter_paths(username, active_subject, active_chapter)
-    data_file = os.path.join(paths["mcq"], f"{active_chapter}_Data.json")
-
     if not st.session_state.quiz_active:
-        _render_quiz_setup_screen(username, active_subject, active_chapter, data_file)
+        _render_quiz_setup_screen(username, active_subject, active_chapter)
     elif not st.session_state.exam_submitted:
         _render_quiz_question_screen()
     else:
