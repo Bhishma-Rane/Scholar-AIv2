@@ -6,29 +6,25 @@ existing deck), a Leitner-box style flip-card study loop, and a
 dedicated "Practice Forgotten" mode that filters to only box-1 cards
 (the ones marked "Forgot") instead of mixing them back into the full deck.
 """
-import os
-import json
 import html
 
 import streamlit as st
 
-from core.paths import get_chapter_paths
+from core.content_store import load_json, save_json, exists as content_exists
 from core.analytics_store import record_study_activity
-from features.flashcards import generate_flashcards
+from features.flashcards import generate_flashcards, CATEGORY as FC_CATEGORY, FILENAME as FC_FILENAME
 
 
-def _load_deck(fc_path: str) -> list:
-    # Fix Issue #9: Graceful file read.
+def _load_deck(username: str, subject: str, chapter: str) -> list:
+    # Fix Issue #9: Graceful read.
     try:
-        with open(fc_path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        return load_json(username, subject, chapter, FC_CATEGORY, FC_FILENAME) or []
     except Exception:
         return []
 
 
-def _save_deck(fc_path: str, fc_data: list):
-    with open(fc_path, "w", encoding="utf-8") as f:
-        json.dump(fc_data, f, indent=4)
+def _save_deck(username: str, subject: str, chapter: str, fc_data: list):
+    save_json(username, subject, chapter, FC_CATEGORY, FC_FILENAME, fc_data)
 
 
 def _render_card(card: dict, idx_in_deck: int, deck_len: int):
@@ -57,7 +53,8 @@ def _render_card(card: dict, idx_in_deck: int, deck_len: int):
 
 def _render_study_loop(
     username: str,
-    fc_path: str,
+    active_subject: str,
+    active_chapter: str,
     fc_data: list,
     study_deck: list,
     mastered_message: str,
@@ -83,7 +80,7 @@ def _render_study_loop(
                 key=f"{key_prefix}_forgot_btn",
         ):
             fc_data[master_idx]["box"] = 1
-            _save_deck(fc_path, fc_data)
+            _save_deck(username, active_subject, active_chapter, fc_data)
             record_study_activity(username)
             # Fix Issue #11: Advance index on forgot.
             st.session_state.fc_idx += 1
@@ -105,7 +102,7 @@ def _render_study_loop(
                 key=f"{key_prefix}_knew_it_btn",
         ):
             fc_data[master_idx]["box"] = card.get("box", 1) + 1
-            _save_deck(fc_path, fc_data)
+            _save_deck(username, active_subject, active_chapter, fc_data)
             record_study_activity(username)
             # Fix Issue #10: Advance index on correct.
             st.session_state.fc_idx += 1
@@ -120,9 +117,7 @@ def render_flashcards_tab(username: str, active_subject: str, active_chapter: st
         st.warning("Select Subject and Chapter first.")
         return
 
-    paths = get_chapter_paths(username, active_subject, active_chapter)
-    fc_path = os.path.join(paths["flashcards"], "Flashcards.json")
-    deck_exists = os.path.exists(fc_path)
+    deck_exists = content_exists(username, active_subject, active_chapter, FC_CATEGORY, FC_FILENAME)
 
     if not deck_exists:
         st.info("No deck yet for this chapter.")
@@ -135,7 +130,7 @@ def render_flashcards_tab(username: str, active_subject: str, active_chapter: st
                     st.rerun()
         return
 
-    fc_data = _load_deck(fc_path)
+    fc_data = _load_deck(username, active_subject, active_chapter)
     if not fc_data:
         st.warning("This deck's file is empty or unreadable. Generate a new one below.")
         fc_count = st.number_input("How many to generate?", 5, 100, 20, key="regen_count")
@@ -157,7 +152,8 @@ def render_flashcards_tab(username: str, active_subject: str, active_chapter: st
     with mode_tab_all:
         _render_study_loop(
             username,
-            fc_path,
+            active_subject,
+            active_chapter,
             fc_data,
             learning_deck,
             "🎉 Deck Mastered! Every card is at Box 5.",
@@ -166,7 +162,8 @@ def render_flashcards_tab(username: str, active_subject: str, active_chapter: st
     with mode_tab_forgotten:
         _render_study_loop(
             username,
-            fc_path,
+            active_subject,
+            active_chapter,
             fc_data,
             forgotten_deck,
             "🎉 Nothing to review — no forgotten cards right now!",
@@ -193,7 +190,7 @@ def render_flashcards_tab(username: str, active_subject: str, active_chapter: st
         if st.button("Reset All Progress"):
             for c in fc_data:
                 c["box"] = 1
-            _save_deck(fc_path, fc_data)
+            _save_deck(username, active_subject, active_chapter, fc_data)
             st.session_state.fc_idx = 0
             st.success("Progress reset.")
             st.rerun()
@@ -204,7 +201,7 @@ def render_flashcards_tab(username: str, active_subject: str, active_chapter: st
         card_to_delete = st.selectbox("Pick a card to remove:", range(len(fc_data)), format_func=lambda i: card_labels[i], key="fc_delete_card_select")
         if st.button("Delete This Card", key="fc_delete_card_btn"):
             del fc_data[card_to_delete]
-            _save_deck(fc_path, fc_data)
+            _save_deck(username, active_subject, active_chapter, fc_data)
             st.session_state.fc_idx = 0
             st.success("Card deleted.")
             st.rerun()
@@ -214,7 +211,8 @@ def render_flashcards_tab(username: str, active_subject: str, active_chapter: st
         with st.popover("Delete Entire Deck", use_container_width=True):
             st.error(f"This permanently deletes all {len(fc_data)} cards for **{active_chapter}**. This can't be undone.")
             if st.button("Confirm delete deck", type="primary", key="fc_delete_deck_confirm"):
-                os.remove(fc_path)
+                from core.content_store import delete as delete_content
+                delete_content(username, active_subject, active_chapter, FC_CATEGORY, FC_FILENAME)
                 st.session_state.fc_idx = 0
                 st.success("Deck deleted.")
                 st.rerun()
