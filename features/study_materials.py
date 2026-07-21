@@ -5,16 +5,24 @@ AI-generated study aids: roadmaps, summaries, cheat sheets, concept maps,
 formula sheets, a vocabulary builder, daily learning goals, and the
 running "Mistake Notebook" profile that tracks a student's weak spots
 across test attempts.
+
+CHANGED: generated materials (roadmaps, summaries, cheat sheets, concept
+maps, the mistake notebook profile) are now saved via core.content_store
+(bridge-backed) instead of local .txt files under core.paths'
+get_chapter_paths(). The local files were silently lost on every
+Streamlit Cloud container restart/redeploy.
 """
 
-import os
 import re
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from core.llm import get_llm
-from core.paths import get_chapter_paths, sanitize_filename
+from core.paths import sanitize_filename
+from core.content_store import save_text, load_text
 from core.vectorstore import get_chapter_text
+
+GUIDES_CATEGORY = "guides"
 
 # Plain-text material types: generated as a single LLM call, saved as .txt.
 MATERIAL_PROMPTS = {
@@ -43,8 +51,7 @@ ALL_MATERIAL_TYPES = list(MATERIAL_PROMPTS.keys()) + [CONCEPT_MAP_TYPE, DAILY_GO
 
 
 def generate_study_material(username: str, subject: str, chapter: str, material_type: str, language: str) -> str:
-    """Generates a roadmap / summary / cheat sheet / formula sheet / vocabulary builder and saves it to disk."""
-    paths = get_chapter_paths(username, subject, chapter)
+    """Generates a roadmap / summary / cheat sheet / formula sheet / vocabulary builder and saves it via the bridge."""
     exact_text = get_chapter_text(username, subject, chapter)
     if not exact_text:
         return "Error: Chapter text not found for generation."
@@ -67,8 +74,7 @@ def generate_study_material(username: str, subject: str, chapter: str, material_
 
         output = llm.invoke(f"Text:\n{context_slice}").content
 
-        with open(os.path.join(paths["guides"], sanitize_filename(material_type) + ".txt"), "w", encoding="utf-8") as f:
-            f.write(output)
+        save_text(username, subject, chapter, GUIDES_CATEGORY, sanitize_filename(material_type) + ".txt", output)
 
         return output
     except Exception as e:
@@ -95,7 +101,6 @@ def generate_concept_map(username: str, subject: str, chapter: str, language: st
     Returns {"success": bool, "concepts": [str, ...]} or
     {"success": False, "error": str}.
     """
-    paths = get_chapter_paths(username, subject, chapter)
     exact_text = get_chapter_text(username, subject, chapter)
     if not exact_text:
         return {"success": False, "error": "Chapter text not found."}
@@ -126,8 +131,7 @@ Chapter text:
         if not concepts:
             return {"success": False, "error": "Model returned an empty concept list."}
 
-        with open(os.path.join(paths["guides"], "Concept_Map.txt"), "w", encoding="utf-8") as f:
-            f.write("\n".join(concepts))
+        save_text(username, subject, chapter, GUIDES_CATEGORY, "Concept_Map.txt", "\n".join(concepts))
 
         return {"success": True, "concepts": concepts}
     except Exception as e:
@@ -180,13 +184,7 @@ def update_mistake_profile(
     Rewrites the chapter's cumulative Mistake Notebook profile after a new
     test attempt, merging new mistakes/strengths into the existing record.
     """
-    paths = get_chapter_paths(username, subject, chapter)
-    profile_path = os.path.join(paths["guides"], "Mistake_Notebook_Profile.txt")
-
-    existing_profile = ""
-    if os.path.exists(profile_path):
-        with open(profile_path, "r", encoding="utf-8", errors="replace") as f:
-            existing_profile = f.read()
+    existing_profile = load_text(username, subject, chapter, GUIDES_CATEGORY, "Mistake_Notebook_Profile.txt") or ""
 
     prompt = f"""You are an elite AI Study Tracker.
 PREVIOUS profile: {existing_profile if existing_profile else 'First test taken.'}
@@ -205,8 +203,7 @@ Use EXACTLY this Markdown format:
             return "Error updating profile: could not initialize AI model."
 
         res = llm.invoke(prompt).content
-        with open(profile_path, "w", encoding="utf-8") as f:
-            f.write(res)
+        save_text(username, subject, chapter, GUIDES_CATEGORY, "Mistake_Notebook_Profile.txt", res)
 
         return res
     except Exception:
