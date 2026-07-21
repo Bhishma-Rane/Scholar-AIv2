@@ -8,16 +8,18 @@ created/stored on local disk — they live on the storage bridge (see
 core/bridge_client.py), since Streamlit Cloud's local filesystem doesn't
 survive container restarts.
 
+CHANGED (follow-up): generated study content (quizzes, mock exams,
+study guides, flashcards) and analytics/streak data are now ALSO
+bridge-backed -- see core/content_store.py and core/analytics_store.py.
+They no longer live under the local folders this file hands out; this
+module's cleanup helpers below purge the bridge-side data too, so
+deleting a chapter/subject/account doesn't leave orphaned blobs behind.
+
 What STAYS local (and is still managed by this file, under USERS_DIR):
   - ChromaDB ("chroma_db") — rebuilt fresh from bridge-fetched PDFs on
     each cold start (see core/vectorstore.py). Not worth persisting the
     DB itself; re-embedding is simpler and the cost is one-time per
     container lifetime, not per-request.
-  - Generated study content (quizzes, mock exams, study guides,
-    flashcards) — NOTE: this is still on local disk for now and will
-    still be lost on a container restart. This is a known follow-up,
-    not yet covered by the bridge. Tracked separately from the
-    subjects/PDFs fix requested here.
 
 Every other module that needs a folder on disk should go through here
 so the directory layout stays consistent and is defined in exactly one
@@ -27,6 +29,7 @@ import os
 import re
 from config import USERS_DIR
 from core import bridge_client
+from core import content_store
 
 
 def sanitize_filename(name: str) -> str:
@@ -125,46 +128,42 @@ def delete_subject_file(username: str, subject: str, filename: str) -> None:
 
 
 # ---------------------------------------------------------------------
-# Local cleanup helpers (chapter/subject/account deletes)
+# Cleanup helpers (chapter/subject/account deletes)
 # ---------------------------------------------------------------------
-# Generated study content (quizzes, mock exams, guides, flashcards) still
-# lives on local disk per the module docstring above, so every delete
-# path that removes a subject/chapter/account on the bridge must ALSO
-# clear the matching local folder here, or orphaned generated content
-# keeps showing up after the "source of truth" (the bridge) has already
-# forgotten the subject/chapter/account ever existed.
+# Generated content and analytics/streak data live on the bridge now
+# (see core/content_store.py, core/analytics_store.py), not on local
+# disk -- so every delete path that removes a subject/chapter/account
+# on the bridge's subjects/files tables must ALSO purge the matching
+# content_store blobs here, or orphaned generated content and stale
+# analytics keep showing up after the "source of truth" has already
+# forgotten the subject/chapter/account ever existed. The local
+# ChromaDB folder is still cleaned up here too since that stays local.
 
 def delete_chapter_local_content(username: str, subject: str, chapter: str) -> None:
-    """Removes a single chapter's locally-generated content (quizzes,
-    mock exams, study guides, flashcards). Safe to call even if nothing
-    was ever generated for this chapter."""
-    import shutil
-    paths = get_user_paths(username, subject)
-    safe_chapter = sanitize_filename(chapter)
-    chapter_folder = os.path.join(paths["subject_study"], safe_chapter)
-    if os.path.exists(chapter_folder):
-        shutil.rmtree(chapter_folder)
+    """Removes a single chapter's generated content (quizzes, mock exams,
+    study guides, flashcards) from the bridge. Safe to call even if
+    nothing was ever generated for this chapter."""
+    content_store.delete_chapter_content(username, subject, chapter)
 
 
 def delete_subject_local_content(username: str, subject: str) -> None:
-    """Removes ALL locally-generated content for every chapter under a
-    subject (used when the whole subject is deleted, not just one
-    chapter). Does not touch the bridge -- call delete_subject_remote()
-    separately for that."""
-    import shutil
-    paths = get_user_paths(username, subject)
-    if os.path.exists(paths["subject_study"]):
-        shutil.rmtree(paths["subject_study"])
+    """Removes ALL generated content for every chapter under a subject
+    from the bridge (used when the whole subject is deleted, not just
+    one chapter). Does not touch the bridge's subjects/files tables --
+    call delete_subject_remote() separately for that."""
+    content_store.delete_subject_content(username, subject)
 
 
 def wipe_local_user_data(username: str) -> None:
-    """Removes EVERYTHING local for this user: generated study content
-    for every subject, analytics.json (quiz history/streaks), and the
-    local ChromaDB. Used by full account deletion. Does not touch the
-    bridge (credentials, subjects, uploaded files, question papers,
-    login tokens) -- call bridge_client.delete_account() separately for
-    that, since those live on the bridge, not here."""
+    """Removes EVERYTHING for this user that isn't already covered by
+    bridge_client.delete_account(): all generated study content and
+    analytics/streak data (both bridge-backed blobs), plus the local
+    ChromaDB folder. Used by full account deletion. Does not touch
+    credentials, subjects, uploaded files, question papers, or login
+    tokens -- call bridge_client.delete_account() separately for those."""
     import shutil
+    bridge_client.blob_delete_prefix(username, "content:")
+    bridge_client.blob_delete(username, "analytics")
     safe_user = sanitize_filename(username).lower()
     user_root = os.path.join(USERS_DIR, safe_user)
     if os.path.exists(user_root):
