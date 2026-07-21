@@ -41,7 +41,7 @@ from langgraph.graph import StateGraph, START, END
 
 from core.llm import get_llm, invoke_with_timeout, internet_search
 from core.bridge_client import BridgeRequestError, BridgeUnavailableError
-from core.paths import get_chapter_paths
+from core.content_store import save_json
 from core.vectorstore import get_vector_store, get_chapter_text
 from features.mock_exams import extract_clean_json
 
@@ -406,7 +406,6 @@ def generate_dynamic_quiz_files(state: AgentState):
     match = re.search(r"ver\s+(.+?)\s+!\s+quiz", state["question"], re.IGNORECASE)
     safe_verse = match.group(1).strip() if match else "Generated"
 
-    paths = get_chapter_paths(state["username"], state["subject"], safe_verse)
     lang = state["language"]
     full_context = state["context"] or ""
     target_count = state["quiz_count"]
@@ -475,8 +474,7 @@ def generate_dynamic_quiz_files(state: AgentState):
                 f"try again or lower the count if this persists.)"
             )
 
-        with open(f"{paths['mcq']}/{safe_verse}_Data.json", "w", encoding="utf-8") as f:
-            json.dump(all_questions, f, indent=4)
+        save_json(state["username"], state["subject"], safe_verse, "mcq", f"{safe_verse}_Data.json", all_questions)
 
         print(f"[ScholarAI] \u2713 Saved {len(all_questions)} questions to {safe_verse}_Data.json")
         return {"response": f"Successfully generated {len(all_questions)} questions!{shortfall_note}"}
