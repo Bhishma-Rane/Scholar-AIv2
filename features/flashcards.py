@@ -15,39 +15,40 @@ CHANGE LOG (this revision):
     quiz-question generation share model_type="quiz" (same num_predict
     budget) but are gated as separate tiers in storage_bridge.py's
     FEATURE_MIN_TIER ("flashcards" vs "quiz_generation").
+  - Decks are now saved via core.content_store (bridge-backed) instead
+    of a local Flashcards.json file. The local file was silently lost
+    on every Streamlit Cloud container restart/redeploy -- students'
+    decks (and their Leitner-box review progress) kept disappearing.
 """
-import os
 import re
 import json
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from core.llm import get_llm
-from core.paths import get_chapter_paths
+from core.content_store import load_json, save_json
 from core.vectorstore import get_chapter_text
 
 BATCH_SIZE = 5
+CATEGORY = "flashcards"
+FILENAME = "Flashcards.json"
 
 
 def generate_flashcards(username: str, subject: str, chapter: str, count: int, language: str, append: bool = False) -> str:
     """
     Generates `count` flashcards for a chapter in batches, saving the
-    final deck as Flashcards.json. Returns "Success" or a "Failed: ..." message.
+    final deck via core.content_store. Returns "Success" or a "Failed: ..." message.
 
     If `append` is True and a deck already exists, the new cards are added
     to the existing deck (new cards start at box 1) instead of overwriting it.
     Duplicate fronts (case-insensitive) are skipped so re-generating doesn't
     pad the deck with near-identical cards.
     """
-    paths = get_chapter_paths(username, subject, chapter)
-    fc_path = os.path.join(paths["flashcards"], "Flashcards.json")
-
     existing_cards = []
     existing_fronts = set()
-    if append and os.path.exists(fc_path):
+    if append:
         try:
-            with open(fc_path, "r", encoding="utf-8") as f:
-                existing_cards = json.load(f)
+            existing_cards = load_json(username, subject, chapter, CATEGORY, FILENAME) or []
             existing_fronts = {c.get("front", "").strip().lower() for c in existing_cards}
         except Exception:
             existing_cards = []
@@ -108,8 +109,7 @@ Format MUST be:
         new_flashcards = new_flashcards[:count]
         combined_deck = existing_cards + new_flashcards
 
-        with open(fc_path, "w", encoding="utf-8") as f:
-            json.dump(combined_deck, f, indent=4)
+        save_json(username, subject, chapter, CATEGORY, FILENAME, combined_deck)
 
         return f"Success: added {len(new_flashcards)} new cards (deck now has {len(combined_deck)} total)."
 
