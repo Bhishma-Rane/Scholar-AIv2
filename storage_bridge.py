@@ -1,39 +1,6 @@
 """
 storage_bridge.py
 ==================
-Runs on Bhishma's Windows laptop (NOT on Streamlit Cloud). Persists
-everything that Streamlit Cloud's ephemeral container filesystem cannot:
-  - User credentials (replacing core/credentials.py's local JSON file)
-  - Login tokens, for auto-login across page reloads
-  - Subject lists and uploaded PDF/TXT files (raw bytes)
-  - Subscription status + tier (manual, pen-and-paper access control)
-  - Feedback (bug reports / suggestions / ratings)
-  - Password reset tokens (admin-issued)
-  - Quiz attempts (practice vs test mode, with server-enforced timer)
-
-Backed by SQLite (one file, easy to back up, no separate DB server needed)
-plus a plain folder on disk for the actual PDF/TXT bytes.
-
-EXPOSE THIS VIA NGROK with a static domain, the same way the Ollama
-tunnel works, e.g.:
-    ngrok http 8800 --domain=your-static-bridge-domain.ngrok-free.app
-
-Then set BRIDGE_BASE_URL in Streamlit Cloud's secrets to that domain.
-
-Run with:
-    uvicorn storage_bridge:app --host 0.0.0.0 --port 8800
-
-Requires (in addition to fastapi/uvicorn/requests):
-    pip install python-multipart
-(needed for the Form(...) based routes below -- without it the app
-fails to even start)
-
-SECURITY NOTE: this bridge has no authentication of its own beyond the
-shared secret header check below. Since it's exposed to the internet via
-ngrok, the BRIDGE_SHARED_SECRET must be set to a long random value, kept
-only in Streamlit Cloud's secrets and this server's environment — never
-committed to git. Anyone with the secret can read/write all stored data,
-so treat it like a password.
 """
 import os
 import json
@@ -318,6 +285,17 @@ def _init_db():
                 count INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (username, feature, usage_date)
             );
+
+            CREATE TABLE IF NOT EXISTS user_blobs (
+                username TEXT NOT NULL,
+                blob_key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY (username, blob_key)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_user_blobs_prefix
+                ON user_blobs (username, blob_key);
             """
         )
 
@@ -606,6 +584,34 @@ class SubmitQuizAttemptRequest(BaseModel):
     max_score: float
 
 
+class BlobSetRequest(BaseModel):
+    """
+    Generic per-user key/value storage. Used for anything that used to
+    live only on the Streamlit Cloud container's local disk and got
+    wiped on every restart/redeploy -- analytics.json (quiz history,
+    topic mastery, streak) and generated study content (flashcards,
+    study guides, mock exams, MCQ decks). Values are stored as-is
+    (callers JSON-encode/decode on their end), so this table doesn't
+    need to know or care what's inside any given blob.
+    """
+    username: str
+    key: str
+    value: str
+
+
+class BlobDeleteRequest(BaseModel):
+    username: str
+    key: str
+
+
+class BlobDeletePrefixRequest(BaseModel):
+    """Deletes every blob whose key starts with `prefix` for this user --
+    e.g. wiping all generated content for one chapter or one subject in
+    a single call, instead of deleting keys one at a time."""
+    username: str
+    prefix: str
+
+
 # ---------------------------------------------------------------------
 # Credential endpoints
 # ---------------------------------------------------------------------
@@ -874,6 +880,7 @@ def delete_account(req: DeleteAccountRequest, x_bridge_secret: Optional[str] = H
         conn.execute("DELETE FROM daily_usage WHERE username = ?", (username,))
         conn.execute("DELETE FROM password_reset_tokens WHERE username = ?", (username,))
         conn.execute("DELETE FROM feedback WHERE username = ?", (username,))
+        conn.execute("DELETE FROM user_blobs WHERE username = ?", (username,))
         # login_tokens cascades automatically via its FK to users (see
         # _init_db()), but deleting it explicitly first costs nothing and
         # doesn't rely on the per-connection "PRAGMA foreign_keys = ON"
@@ -1036,6 +1043,87 @@ def delete_file(username: str = Form(...), subject: str = Form(...), filename: s
     if row and os.path.exists(row["stored_path"]):
         os.remove(row["stored_path"])
 
+    return {"success": True}
+
+
+# ---------------------------------------------------------------------
+# Generic blob storage (analytics/streak + generated study content)
+#
+# Fixes the class of bug where analytics.json (quiz history, topic
+# mastery, streak) and generated content (flashcards, study guides,
+# mock exams, MCQ decks) lived only on Streamlit Cloud's container
+# disk and were lost on every restart/redeploy -- the same problem
+# subjects/uploaded files hit before THEY were moved onto this bridge.
+# Callers own their own key naming and JSON encoding; this table is
+# intentionally schema-agnostic.
+# ---------------------------------------------------------------------
+@app.post("/blobs/set")
+def set_blob(req: BlobSetRequest, x_bridge_secret: Optional[str] = Header(None)):
+    _require_secret(x_bridge_secret)
+    username = _sanitize(req.username).lower()
+    with contextlib.closing(_get_conn()) as conn:
+        conn.execute(
+            "INSERT INTO user_blobs (username, blob_key, value, updated_at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(username, blob_key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            (username, req.key, req.value, time.time()),
+        )
+        conn.commit()
+    return {"success": True}
+
+
+@app.get("/blobs/get")
+def get_blob(username: str, key: str, x_bridge_secret: Optional[str] = Header(None)):
+    _require_secret(x_bridge_secret)
+    username = _sanitize(username).lower()
+    with contextlib.closing(_get_conn()) as conn:
+        row = conn.execute(
+            "SELECT value FROM user_blobs WHERE username = ? AND blob_key = ?",
+            (username, key),
+        ).fetchone()
+    if row is None:
+        return {"found": False, "value": None}
+    return {"found": True, "value": row["value"]}
+
+
+@app.get("/blobs/list")
+def list_blobs(username: str, prefix: str = "", x_bridge_secret: Optional[str] = Header(None)):
+    """Returns keys for this user starting with `prefix` (empty prefix = all keys).
+    Used to enumerate e.g. every generated-content key under a chapter."""
+    _require_secret(x_bridge_secret)
+    username = _sanitize(username).lower()
+    # Escape LIKE wildcards in the prefix itself so a chapter/subject name
+    # containing "%" or "_" doesn't accidentally match unrelated keys.
+    escaped_prefix = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    with contextlib.closing(_get_conn()) as conn:
+        rows = conn.execute(
+            "SELECT blob_key FROM user_blobs WHERE username = ? AND blob_key LIKE ? ESCAPE '\\' "
+            "ORDER BY blob_key",
+            (username, escaped_prefix + "%"),
+        ).fetchall()
+    return {"keys": [r["blob_key"] for r in rows]}
+
+
+@app.post("/blobs/delete")
+def delete_blob(req: BlobDeleteRequest, x_bridge_secret: Optional[str] = Header(None)):
+    _require_secret(x_bridge_secret)
+    username = _sanitize(req.username).lower()
+    with contextlib.closing(_get_conn()) as conn:
+        conn.execute("DELETE FROM user_blobs WHERE username = ? AND blob_key = ?", (username, req.key))
+        conn.commit()
+    return {"success": True}
+
+
+@app.post("/blobs/delete_prefix")
+def delete_blob_prefix(req: BlobDeletePrefixRequest, x_bridge_secret: Optional[str] = Header(None)):
+    _require_secret(x_bridge_secret)
+    username = _sanitize(req.username).lower()
+    escaped_prefix = req.prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    with contextlib.closing(_get_conn()) as conn:
+        conn.execute(
+            "DELETE FROM user_blobs WHERE username = ? AND blob_key LIKE ? ESCAPE '\\'",
+            (username, escaped_prefix + "%"),
+        )
+        conn.commit()
     return {"success": True}
 
 
