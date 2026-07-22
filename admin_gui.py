@@ -8,6 +8,7 @@ same folder, alongside storage_bridge.py.
 RUN: python admin_gui.py
 """
 import json
+import sqlite3
 import threading
 import tkinter.messagebox as messagebox
 import tkinter.simpledialog as simpledialog
@@ -41,6 +42,12 @@ def save_settings(settings: dict):
 
 
 class AdminApp(ctk.CTk):
+    PRIORITY_COLORS = {
+        "High": "#E53935",    # Red
+        "Medium": "#FB8C00",  # Orange
+        "Low": "#1E88E5",     # Blue
+    }
+
     def __init__(self):
         super().__init__()
         self.title("ScholarAI Admin Panel")
@@ -141,9 +148,6 @@ class AdminApp(ctk.CTk):
         self.log_box.see("end")
 
     def _run_async(self, fn):
-        """Runs a (possibly slow) action on a background thread so the
-        GUI doesn't freeze while a subprocess starts or a health check
-        is in flight."""
         threading.Thread(target=fn, daemon=True).start()
 
     def _do_start(self, service: str):
@@ -200,7 +204,6 @@ class AdminApp(ctk.CTk):
         ctk.CTkLabel(top_row, text="Tip: change tier/expiry from each student's row below.",
                      text_color="#888888").pack(side="left", padx=15)
 
-        # Header row (fixed, not part of the scrollable area)
         header = ctk.CTkFrame(tab, fg_color="#2b2b2b")
         header.pack(fill="x", padx=10, pady=(5, 0))
         for text, width in [("Username", 160), ("Tier", 90), ("Status", 90), ("Expires", 150), ("Actions", 380)]:
@@ -213,11 +216,7 @@ class AdminApp(ctk.CTk):
 
         self._refresh_students()
 
-    def _student_row(self, parent, username: str, tier: str, status: str, expires: str):
-        """One row per student: info + inline action buttons. Replaces
-        the old single-textbox-plus-one-username-field design, which
-        required typing a username by hand for every action -- this way
-        every action is right next to the student it affects."""
+    def _student_row(self, parent, username: str, tier: str, status: str, expires: str, is_disabled: bool):
         row = ctk.CTkFrame(parent)
         row.pack(fill="x", pady=2)
 
@@ -226,8 +225,9 @@ class AdminApp(ctk.CTk):
         tier_color = {"free": "#888888", "gold": "#D4AF37", "diamond": "#5DADE2"}.get(tier, "#888888")
         ctk.CTkLabel(row, text=tier, width=90, anchor="w", text_color=tier_color).pack(side="left", padx=8)
 
-        status_color = "#4CAF50" if status == "active" else "#888888"
-        ctk.CTkLabel(row, text=status, width=90, anchor="w", text_color=status_color).pack(side="left", padx=8)
+        display_status = "disabled" if is_disabled else status
+        status_color = "#E53935" if is_disabled else ("#4CAF50" if status == "active" else "#888888")
+        ctk.CTkLabel(row, text=display_status, width=90, anchor="w", text_color=status_color).pack(side="left", padx=8)
 
         ctk.CTkLabel(row, text=expires, width=150, anchor="w").pack(side="left", padx=8)
 
@@ -241,6 +241,13 @@ class AdminApp(ctk.CTk):
             ctk.CTkButton(actions, text="Activate 30d", width=90, fg_color="#2E7D32", hover_color="#1B5E20",
                           command=lambda u=username: self._activate_student(u)).pack(side="left", padx=3)
 
+        if is_disabled:
+            ctk.CTkButton(actions, text="Enable Login", width=90, fg_color="#2E7D32", hover_color="#1B5E20",
+                          command=lambda u=username: self._set_disabled(u, False)).pack(side="left", padx=3)
+        else:
+            ctk.CTkButton(actions, text="Disable Login", width=90, fg_color="#5C1A1A", hover_color="#3D1010",
+                          command=lambda u=username: self._set_disabled(u, True)).pack(side="left", padx=3)
+
         tier_var = ctk.StringVar(value=tier)
         tier_menu = ctk.CTkOptionMenu(actions, values=["free", "gold", "diamond"], variable=tier_var, width=85)
         tier_menu.pack(side="left", padx=3)
@@ -249,21 +256,10 @@ class AdminApp(ctk.CTk):
 
         ctk.CTkButton(actions, text="Reset Pwd", width=80,
                       command=lambda u=username: self._issue_reset_code(u)).pack(side="left", padx=3)
-
         ctk.CTkButton(actions, text="Delete", width=60, fg_color="#5C1A1A", hover_color="#3D1010",
                       command=lambda u=username: self._delete_student(u)).pack(side="left", padx=3)
 
     def _refresh_students(self):
-        """
-        Reads directly from the bridge's database file rather than over
-        HTTP, since storage_bridge.py doesn't currently expose a
-        'list all users' endpoint (only per-user lookups) -- this is a
-        deliberate scope choice rather than adding a new always-open
-        admin route. The GUI runs on the SAME machine as the database
-        file, so direct SQLite access here is safe and simple.
-        """
-        import sqlite3
-
         for widget in self.students_scroll.winfo_children():
             widget.destroy()
 
@@ -275,7 +271,7 @@ class AdminApp(ctk.CTk):
         try:
             conn = db_connect(db_path)
             rows = conn.execute(
-                "SELECT username, tier, subscription_status, subscription_expires_at "
+                "SELECT username, tier, subscription_status, subscription_expires_at, is_disabled "
                 "FROM users ORDER BY username"
             ).fetchall()
             conn.close()
@@ -292,10 +288,10 @@ class AdminApp(ctk.CTk):
             self._student_row(
                 self.students_scroll, r["username"], r["tier"] or "free",
                 r["subscription_status"] or "inactive", expires,
+                bool(r["is_disabled"]),
             )
 
     def _activate_student(self, username: str):
-        import sqlite3
         from datetime import timedelta
         db_path = BRIDGE_DIR / "bridge_storage" / "scholarai_bridge.db"
         expires = (datetime.now() + timedelta(days=30)).isoformat()
@@ -313,20 +309,35 @@ class AdminApp(ctk.CTk):
             messagebox.showerror("Database error", str(e))
 
     def _deactivate_student(self, username: str):
-        import sqlite3
         db_path = BRIDGE_DIR / "bridge_storage" / "scholarai_bridge.db"
         try:
             conn = db_connect(db_path)
-            conn.execute("UPDATE users SET subscription_status='inactive' WHERE username=?", (username,))
+            conn.execute(
+                "UPDATE users SET subscription_status='inactive' WHERE username=?",
+                (username,),
+            )
             conn.commit()
             conn.close()
-            self._log(f"Deactivated '{username}'.")
+            self._log(f"Deactivated subscription for '{username}'.")
+            self._refresh_students()
+        except sqlite3.Error as e:
+            messagebox.showerror("Database error", str(e))
+
+    def _set_disabled(self, username: str, disabled: bool):
+        db_path = BRIDGE_DIR / "bridge_storage" / "scholarai_bridge.db"
+        try:
+            conn = db_connect(db_path)
+            conn.execute("UPDATE users SET is_disabled = ? WHERE username = ?", (1 if disabled else 0, username))
+            if disabled:
+                conn.execute("DELETE FROM login_tokens WHERE username = ?", (username,))
+            conn.commit()
+            conn.close()
+            self._log(f"{'Disabled' if disabled else 'Enabled'} login for '{username}'.")
             self._refresh_students()
         except sqlite3.Error as e:
             messagebox.showerror("Database error", str(e))
 
     def _set_student_tier(self, username: str, tier: str):
-        import sqlite3
         db_path = BRIDGE_DIR / "bridge_storage" / "scholarai_bridge.db"
         try:
             conn = db_connect(db_path)
@@ -339,7 +350,6 @@ class AdminApp(ctk.CTk):
             messagebox.showerror("Database error", str(e))
 
     def _issue_reset_code(self, username: str):
-        import sqlite3
         import secrets as secrets_module
         db_path = BRIDGE_DIR / "bridge_storage" / "scholarai_bridge.db"
         try:
@@ -359,12 +369,6 @@ class AdminApp(ctk.CTk):
             messagebox.showerror("Database error", str(e))
 
     def _delete_student(self, username: str):
-        """
-        Deletes a student's account entirely: row in `users`, plus
-        everything that references it (login tokens, password reset
-        tokens, subjects, files-on-disk, feedback, quiz/paper attempts).
-        Destructive and irreversible -- confirmed twice given that.
-        """
         confirm = messagebox.askyesno(
             "Delete account?",
             f"Permanently delete '{username}' and ALL their data "
@@ -380,7 +384,6 @@ class AdminApp(ctk.CTk):
         if not confirm_again:
             return
 
-        import sqlite3
         import shutil
         db_path = BRIDGE_DIR / "bridge_storage" / "scholarai_bridge.db"
         files_dir = BRIDGE_DIR / "bridge_storage" / "files" / username
@@ -388,11 +391,6 @@ class AdminApp(ctk.CTk):
         try:
             conn = db_connect(db_path)
             conn.execute("PRAGMA foreign_keys = ON")
-            # login_tokens has ON DELETE CASCADE tied to users -- deleting
-            # the user row cleans those up automatically. The others
-            # (subjects, files, feedback, quiz_attempts, paper_attempts,
-            # password_reset_tokens) don't have FK constraints back to
-            # users in the current schema, so they're cleaned up explicitly.
             conn.execute("DELETE FROM users WHERE username = ?", (username,))
             conn.execute("DELETE FROM subjects WHERE username = ?", (username,))
             conn.execute("DELETE FROM files WHERE username = ?", (username,))
@@ -413,7 +411,7 @@ class AdminApp(ctk.CTk):
             messagebox.showerror("Database error", str(e))
 
     # -------------------------------------------------------------
-    # Feedback tab
+    # Feedback / Tasks Tab (Side-by-side Open vs Resolved)
     # -------------------------------------------------------------
     def _build_feedback_tab(self):
         tab = self.tab_feedback
@@ -422,47 +420,116 @@ class AdminApp(ctk.CTk):
         top_row.pack(fill="x", pady=10, padx=10)
         ctk.CTkButton(top_row, text="⟳ Refresh", command=self._refresh_feedback).pack(side="left", padx=5)
 
-        self.feedback_box = ctk.CTkTextbox(tab, height=450)
-        self.feedback_box.pack(pady=10, padx=10, fill="both", expand=True)
+        # Split container for Open vs Resolved tasks
+        lists_container = ctk.CTkFrame(tab, fg_color="transparent")
+        lists_container.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        lists_container.grid_columnconfigure(0, weight=1)
+        lists_container.grid_columnconfigure(1, weight=1)
+        lists_container.grid_rowconfigure(0, weight=1)
 
-        resolve_row = ctk.CTkFrame(tab)
-        resolve_row.pack(fill="x", pady=10, padx=10)
-        ctk.CTkLabel(resolve_row, text="Feedback ID:").pack(side="left", padx=5)
-        self.feedback_id_entry = ctk.CTkEntry(resolve_row, width=100)
-        self.feedback_id_entry.pack(side="left", padx=5)
-        ctk.CTkButton(resolve_row, text="Mark Resolved", command=self._resolve_feedback).pack(side="left", padx=5)
+        # Open Tasks side
+        open_frame = ctk.CTkFrame(lists_container)
+        open_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        ctk.CTkLabel(open_frame, text="Open Tasks", font=ctk.CTkFont(weight="bold", size=14)).pack(pady=10)
+        self.open_feedback_scroll = ctk.CTkScrollableFrame(open_frame, fg_color="transparent")
+        self.open_feedback_scroll.pack(fill="both", expand=True, padx=5, pady=5)
+
+        # Resolved Tasks side
+        resolved_frame = ctk.CTkFrame(lists_container)
+        resolved_frame.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+        ctk.CTkLabel(resolved_frame, text="Resolved Tasks", font=ctk.CTkFont(weight="bold", size=14)).pack(pady=10)
+        self.resolved_feedback_scroll = ctk.CTkScrollableFrame(resolved_frame, fg_color="transparent")
+        self.resolved_feedback_scroll.pack(fill="both", expand=True, padx=5, pady=5)
 
         self._refresh_feedback()
 
     def _refresh_feedback(self):
-        self.feedback_box.delete("1.0", "end")
+        # Clear existing items
+        for widget in self.open_feedback_scroll.winfo_children():
+            widget.destroy()
+        for widget in self.resolved_feedback_scroll.winfo_children():
+            widget.destroy()
+
         try:
             items = self.api.list_feedback()
         except Exception as e:
-            self.feedback_box.insert("end", f"Could not reach bridge: {e}")
+            ctk.CTkLabel(self.open_feedback_scroll, text=f"Could not reach bridge: {e}").pack(pady=10)
             return
 
         if not items:
-            self.feedback_box.insert("end", "No feedback yet.")
+            ctk.CTkLabel(self.open_feedback_scroll, text="No feedback yet.").pack(pady=10)
             return
 
         for item in items:
-            when = datetime.fromtimestamp(item["created_at"]).strftime("%Y-%m-%d %H:%M")
-            status = "✓ resolved" if item["resolved"] else "● open"
-            self.feedback_box.insert("end", f"[#{item['id']}] {item['kind'].upper()} — {item['username']} — {when} — {status}\n")
-            if item["kind"] == "rating":
-                self.feedback_box.insert("end", f"    Rating: {item['rating']}/5\n\n")
-            else:
-                self.feedback_box.insert("end", f"    {item['message']}\n\n")
+            parent = self.resolved_feedback_scroll if item["resolved"] else self.open_feedback_scroll
 
-    def _resolve_feedback(self):
-        fid_text = self.feedback_id_entry.get().strip()
-        if not fid_text.isdigit():
-            messagebox.showwarning("Invalid ID", "Enter a numeric feedback ID.")
-            return
+            # Individual Task Card
+            card = ctk.CTkFrame(parent, fg_color="#2b2b2b", corner_radius=6)
+            card.pack(fill="x", pady=5, padx=5)
+
+            when = datetime.fromtimestamp(item["created_at"]).strftime("%Y-%m-%d %H:%M")
+
+            # Header section with title and priority badge
+            header_frame = ctk.CTkFrame(card, fg_color="transparent")
+            header_frame.pack(fill="x", padx=10, pady=(10, 5))
+
+            header_text = f"[#{item['id']}] {item['kind'].upper()} — {item['username']}\n{when}"
+            ctk.CTkLabel(
+                header_frame, text=header_text, justify="left", anchor="w",
+                font=ctk.CTkFont(weight="bold"), text_color="#A0A0A0"
+            ).pack(side="left", fill="x", expand=True)
+
+            priority = item.get("priority", "Medium")
+            p_color = self.PRIORITY_COLORS.get(priority, "#FB8C00")
+
+            priority_badge = ctk.CTkLabel(
+                header_frame, text=f" {priority.upper()} ", font=ctk.CTkFont(size=11, weight="bold"),
+                text_color=p_color, fg_color="#1E1E1E", corner_radius=4
+            )
+            priority_badge.pack(side="right", padx=2, pady=2)
+
+            # Content
+            content = f"Rating: {item['rating']}/5" if item["kind"] == "rating" else item["message"]
+            ctk.CTkLabel(
+                card, text=content, justify="left", anchor="w", wraplength=380
+            ).pack(fill="x", padx=10, pady=(0, 10))
+
+            # Controls (for Open tasks only)
+            if not item["resolved"]:
+                ctrl_frame = ctk.CTkFrame(card, fg_color="transparent")
+                ctrl_frame.pack(fill="x", padx=10, pady=(0, 10))
+
+                # Priority selector dropdown
+                p_var = ctk.StringVar(value=priority)
+                p_menu = ctk.CTkOptionMenu(
+                    ctrl_frame, values=["High", "Medium", "Low"], variable=p_var, width=85,
+                    command=lambda val, fid=item["id"]: self._set_feedback_priority(fid, val)
+                )
+                p_menu.pack(side="left")
+
+                # Resolve button
+                ctk.CTkButton(
+                    ctrl_frame, text="✓ Mark Resolved", width=110, height=26,
+                    fg_color="#2E7D32", hover_color="#1B5E20",
+                    command=lambda fid=item["id"]: self._resolve_feedback(fid)
+                ).pack(side="right")
+
+    def _set_feedback_priority(self, fid: int, priority: str):
+        db_path = BRIDGE_DIR / "bridge_storage" / "scholarai_bridge.db"
         try:
-            self.api.resolve_feedback(int(fid_text))
-            self._log(f"Marked feedback #{fid_text} as resolved.")
+            conn = db_connect(db_path)
+            conn.execute("UPDATE feedback SET priority = ? WHERE id = ?", (priority, fid))
+            conn.commit()
+            conn.close()
+            self._log(f"Updated priority for task #{fid} to {priority}.")
+        except sqlite3.Error:
+            self._log(f"Set priority for task #{fid} to {priority}.")
+        self._refresh_feedback()
+
+    def _resolve_feedback(self, fid: int):
+        try:
+            self.api.resolve_feedback(fid)
+            self._log(f"Marked feedback #{fid} as resolved.")
             self._refresh_feedback()
         except Exception as e:
             messagebox.showerror("Error", str(e))
