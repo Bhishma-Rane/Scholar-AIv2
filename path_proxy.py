@@ -136,4 +136,3 @@ if __name__ == "__main__":
     for prefix, target in ROUTES.items():
         log.info(f"  {prefix}/*  ->  {target}")
     web.run_app(build_app(), host="127.0.0.1", port=LISTEN_PORT)
-  
