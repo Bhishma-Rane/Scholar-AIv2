@@ -15,21 +15,40 @@ there's no behavioral difference between them for grading purposes, only
 the constraints students see when answering (a short box vs. a long box vs.
 a passage above the question) differ, which is a UI concern (layer 3),
 not a grading concern.
+
+BUGFIX (this revision):
+- core/llm.py's get_llm() requires a `username` (used for the bridge's
+  subscription/tier gate) and returns None -- silently, no exception --
+  if it isn't passed. This function was calling get_llm() with no
+  arguments at all, so grading ALWAYS fell into the "Grading unavailable:
+  LLM engine offline." fallback, regardless of whether the LLM backend
+  was actually reachable. Fixed by adding a `username` parameter here and
+  threading it through to get_llm().
+
+  IMPORTANT: every call site of grade_written_answer() (e.g.
+  grade_paper_attempt()) now needs to pass `username=...` through as
+  well, the same way every get_llm() call site had to be updated per
+  core/llm.py's own change log. Search your codebase for
+  `grade_written_answer(` and update each call site.
 """
+
 import re
 import json
 
 from core.llm import get_llm
 
 
-def grade_written_answer(question: dict, user_answer: str, lang: str = "English") -> dict:
+def grade_written_answer(question: dict, user_answer: str, lang: str = "English", username: str = None) -> dict:
     """
     question: a paper_questions row dict, with question_text and marks set.
-            For case_based sub-questions, the caller should pass the PARENT's
-        passage as part of the prompt context (see grade_paper_attempt,
-        which threads this through) so the LLM grades with full context,
-        not just the sub-question in isolation.
+      For case_based sub-questions, the caller should pass the PARENT's
+      passage as part of the prompt context (see grade_paper_attempt,
+      which threads this through) so the LLM grades with full context,
+      not just the sub-question in isolation.
     user_answer: the student's free-text answer.
+    username: REQUIRED to actually reach the LLM -- see BUGFIX note above.
+      Without it, get_llm() refuses to hand back an LLM and this function
+      always returns the "LLM engine offline" fallback.
 
     Returns {"marks_earned": float, "marks_possible": float, "feedback": str},
     matching grade_subjective_answer()'s exact shape so paper grading can
@@ -55,7 +74,6 @@ def grade_written_answer(question: dict, user_answer: str, lang: str = "English"
         }
 
     user_answer = (user_answer or "").strip()
-
     if not user_answer:
         return {
             "marks_earned": 0,
@@ -72,6 +90,7 @@ def grade_written_answer(question: dict, user_answer: str, lang: str = "English"
     key_block = f"Reference answer key: {answer_key}\n" if answer_key else ""
 
     grading_prompt = f"""You are a strict but fair exam grader. Respond in {lang}.
+
 {context_block}Question: {question.get('question_text', '')}
 {key_block}Student's Answer: {user_answer}
 Maximum Marks: {marks_possible}
@@ -85,8 +104,9 @@ get partial marks, not zero. A fully blank or completely wrong answer gets 0.
 RETURN STRICTLY AS JSON, NOTHING ELSE:
 {{"marks_earned": <number between 0 and {marks_possible}, can be a decimal>, "feedback": "<one sentence>"}}
 """
+
     try:
-        llm = get_llm()
+        llm = get_llm(username=username)
         if not llm:
             return {
                 "marks_earned": 0,
