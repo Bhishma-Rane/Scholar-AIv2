@@ -15,15 +15,69 @@ including plain physical objects that aren't anatomy (e.g. "headphones").
 
 A "Socratic Tutor" toggle changes the chat's teaching style to guide with
 questions instead of giving direct answers immediately.
+
+CHANGED: chat history is now persisted per (student, subject, chapter) via
+core.content_store (bridge-backed), not just kept in st.session_state for
+the life of the browser session. This is what makes two things possible:
+  1. A student's conversation survives a refresh/reconnect instead of
+     vanishing, and correctly shows THAT chapter's own history when they
+     switch subjects/chapters (previously chat_messages was one flat list
+     that didn't care which chapter was active).
+  2. The admin panel (ui/tab_admin.py, config.ADMIN_USERNAME) can load and
+     clear any student's chat for a given subject/chapter, since it's the
+     same content_store.load_chat_messages()/clear_chat_messages() calls
+     just pointed at a different username.
+Storage is scoped by username on every call (see core/content_store.py),
+so a regular student can only ever load/save their OWN chat -- the app
+never passes anything but the logged-in user's own username here.
+
+Also adds CSS to pin the chat input to the bottom of the viewport, since
+Streamlit's default docking can visually drift once a tab layout, sidebar,
+and admin panel are all on the page at once.
 """
 import streamlit as st
 from langchain_core.messages import HumanMessage, AIMessage
 
 from core.llm import search_images
 from core.analytics_store import record_study_activity
+from core import content_store
 from features.chat_graph import vedic_graph
 from features.socratic_tutor import wrap_socratic_instruction
 from features.study_memory import build_memory_context
+
+
+def _inject_pinned_input_css():
+    """Forces the chat input to stay fixed to the bottom of the viewport,
+    like a modern chat app, instead of relying on Streamlit's default
+    (which can drift depending on layout/sidebar state). Also pads the
+    bottom of the page so the last message isn't hidden behind it."""
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stChatInput"] {
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            z-index: 999;
+            background-color: var(--background-color, #ffffff);
+            padding: 0.75rem 1rem calc(0.75rem + env(safe-area-inset-bottom, 0px)) 1rem;
+            box-shadow: 0 -2px 8px rgba(0, 0, 0, 0.06);
+        }
+        /* Match the input's left offset to the sidebar so it doesn't run under it */
+        @media (min-width: 768px) {
+            section[data-testid="stSidebar"][aria-expanded="true"] ~ div div[data-testid="stChatInput"] {
+                left: var(--sidebar-width, 21rem);
+            }
+        }
+        /* Keep the last chat bubble from being hidden behind the fixed input */
+        div[data-testid="stVerticalBlock"] > div:has(> div[data-testid="stChatMessage"]:last-of-type) {
+            padding-bottom: 6rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def _render_message(msg: dict):
@@ -35,6 +89,33 @@ def _render_message(msg: dict):
             for col, img in zip(cols, msg["image_results"]):
                 with col:
                     st.image(img["image_url"], caption=img.get("title", ""), use_container_width=True)
+
+
+def _sync_chat_scope(username: str, active_subject: str, active_chapter: str):
+    """Loads this student's persisted chat for the current (subject, chapter)
+    into session state, but only when the scope actually changed -- so we're
+    not re-fetching from the bridge on every widget interaction/rerun. Falls
+    back to an empty, unsaved scratch list while no real subject/chapter is
+    selected yet."""
+    if active_subject == "Select Subject" or active_chapter == "Select Chapter":
+        st.session_state.chat_messages = []
+        st.session_state["_chat_scope"] = None
+        return
+
+    scope_key = (username, active_subject, active_chapter)
+    if st.session_state.get("_chat_scope") != scope_key:
+        st.session_state.chat_messages = content_store.load_chat_messages(
+            username, active_subject, active_chapter
+        )
+        st.session_state["_chat_scope"] = scope_key
+
+
+def _persist_chat(username: str, active_subject: str, active_chapter: str):
+    """Saves the current in-memory chat_messages back to storage. No-op while
+    no real subject/chapter is selected (nothing to key the save under)."""
+    if active_subject == "Select Subject" or active_chapter == "Select Chapter":
+        return
+    content_store.save_chat_messages(username, active_subject, active_chapter, st.session_state.chat_messages)
 
 
 def _handle_diagram_command(prompt: str, active_chapter: str):
@@ -74,6 +155,11 @@ def _handle_diagram_command(prompt: str, active_chapter: str):
 
 def render_chat_tab(username: str, active_subject: str, active_chapter: str, data_source: str, target_language: str):
     st.header("Interactive Content Tutor")
+    _inject_pinned_input_css()
+    _sync_chat_scope(username, active_subject, active_chapter)
+
+    if active_subject == "Select Subject" or active_chapter == "Select Chapter":
+        st.info("👆 Pick a subject and active chapter in the Workspace tab to start chatting.")
 
     socratic_mode = st.toggle(
         "🧠 Socratic Tutor Mode",
@@ -139,3 +225,9 @@ def render_chat_tab(username: str, active_subject: str, active_chapter: str, dat
 
                 st.markdown(response_text)
                 st.session_state.chat_messages.append({"role": "assistant", "content": response_text})
+
+    # Persist once per turn (covers both the !diagram branch and the normal
+    # LLM branch above), so the next load for this (subject, chapter) picks
+    # up right where this conversation left off -- and so the admin panel
+    # sees it too.
+    _persist_chat(username, active_subject, active_chapter)
