@@ -18,7 +18,7 @@ instead of being buried in a cramped sidebar section.
 
 import streamlit as st
 
-from config import configure_page, init_session_state, inject_css, render_brand_header, DEFAULT_THEME_COLOR
+from config import configure_page, init_session_state, inject_css, render_brand_header, DEFAULT_THEME_COLOR, ADMIN_USERNAME
 from core.paths import get_user_paths
 from core.bridge_client import get_theme_color, BridgeUnavailableError
 from ui.auth import require_login
@@ -31,6 +31,7 @@ from ui.tab_study import render_study_tab
 from ui.tab_practice import render_practice_tab
 from ui.tab_progress import render_progress_tab
 from ui.tab_settings import render_settings_tab
+from ui.tab_admin import render_admin_tab
 from ui.feedback_widget import render_feedback_widget
 
 configure_page()
@@ -57,17 +58,26 @@ sidebar_selections = render_sidebar(username)
 data_source = sidebar_selections["data_source"]
 target_language = sidebar_selections["target_language"]
 
-tab_workspace, tab_dashboard, tab_chat, tab_study, tab_practice, tab_progress, tab_settings = st.tabs(
-    [
-        "📁 Workspace",
-        "🤖 Dashboard",
-        "💬 Tutor",
-        "📚 Study",
-        "📝 Practice & Exams",
-        "📊 Progress",
-        "⚙️ Settings",
-    ]
-)
+is_admin = username == ADMIN_USERNAME
+
+tab_labels = [
+    "📁 Workspace",
+    "🤖 Dashboard",
+    "💬 Tutor",
+    "📚 Study",
+    "📝 Practice & Exams",
+    "📊 Progress",
+    "⚙️ Settings",
+]
+if is_admin:
+    tab_labels.append("🔐 Admin")
+
+tabs = st.tabs(tab_labels)
+(
+    tab_workspace, tab_dashboard, tab_chat, tab_study,
+    tab_practice, tab_progress, tab_settings,
+) = tabs[:7]
+tab_admin = tabs[7] if is_admin else None
 
 with tab_workspace:
     workspace_selections = render_workspace_tab(username, user_paths)
@@ -92,6 +102,10 @@ with tab_progress:
 
 with tab_settings:
     render_settings_tab(username)
+
+if tab_admin is not None:
+    with tab_admin:
+        render_admin_tab()
 
 # Both of these run AFTER the real app above is fully rendered, so
 # whichever one is active (first-run dialog, or either flavor of the
