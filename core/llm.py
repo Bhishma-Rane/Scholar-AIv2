@@ -90,8 +90,8 @@ PREVIOUS REVISION'S CHANGE LOG (why BridgeChatLLM exists at all):
 import threading
 from typing import Optional, Union
 
+import requests
 from langchain_community.tools import DuckDuckGoSearchRun
-from ddgs import DDGS
 
 from core import bridge_client
 from core.bridge_client import BridgeRequestError, BridgeUnavailableError
@@ -118,28 +118,69 @@ _MODEL_TYPE_TO_FEATURE = {
 }
 
 
+_COMMONS_API_URL = "https://commons.wikimedia.org/w/api.php"
+_COMMONS_IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".svg", ".gif", ".webp")
+
+# CHANGED: was DuckDuckGo image search via the `ddgs` library. That library
+# scrapes DDG's HTML to extract a "vqd" auth token per-query, and DDG has
+# started blocking that scrape -- every single call now fails with
+# DDGSException("Could not extract vqd."), regardless of query or network
+# health. This isn't something we can fix on our end (no API key, no
+# request param changes get around it), and it's broken this way before
+# and will likely break again since it's an unofficial scrape. Swapped to
+# Wikimedia Commons' public MediaWiki API instead: no API key, no rate-limit
+# auth dance, and it's well suited to this use case since Commons is full of
+# labeled educational/anatomy diagrams (the exact thing "!diagram the human
+# heart" wants).
 def search_images(query: str, max_results: int = 4) -> list:
     """
-    Free, no-API-key image search via DuckDuckGo. Used for "VISUAL" diagram
-    requests (e.g. "the human heart") where a real labeled image is needed
-    rather than a Mermaid diagram.
+    Free, no-API-key image search via the Wikimedia Commons API. Used for
+    "VISUAL" diagram requests (e.g. "the human heart") where a real labeled
+    image is needed rather than a Mermaid diagram.
 
     Returns a list of {"title": str, "image_url": str, "source_url": str}.
     Returns an empty list on any failure rather than raising, since this
     is a best-effort enhancement, not a critical path.
     """
     try:
-        with DDGS() as ddgs:
-            raw_results = list(ddgs.images(query, max_results=max_results))
-        return [
-            {
-                "title": r.get("title", query),
-                "image_url": r.get("image", ""),
-                "source_url": r.get("url", ""),
-            }
-            for r in raw_results
-            if r.get("image")
-        ]
+        params = {
+            "action": "query",
+            "generator": "search",
+            "gsrsearch": f"filetype:bitmap|drawing {query}",
+            "gsrnamespace": 6,  # File: namespace only
+            "gsrlimit": max_results,
+            "prop": "imageinfo",
+            "iiprop": "url",
+            "iiurlwidth": 800,
+            "format": "json",
+        }
+        resp = requests.get(
+            _COMMONS_API_URL,
+            params=params,
+            headers={"User-Agent": "ScholarAI-v2/1.0 (study companion app)"},
+            timeout=8,
+        )
+        resp.raise_for_status()
+        pages = resp.json().get("query", {}).get("pages", {})
+
+        results = []
+        for page in pages.values():
+            title = page.get("title", query).replace("File:", "", 1)
+            infos = page.get("imageinfo") or []
+            if not infos:
+                continue
+            info = infos[0]
+            url = info.get("thumburl") or info.get("url", "")
+            if not url.lower().endswith(_COMMONS_IMAGE_EXTS):
+                continue
+            results.append(
+                {
+                    "title": title,
+                    "image_url": url,
+                    "source_url": info.get("descriptionurl", url),
+                }
+            )
+        return results[:max_results]
     except Exception:
         return []
 
