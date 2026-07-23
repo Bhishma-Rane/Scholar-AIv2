@@ -102,3 +102,45 @@ def delete_subject_content(username: str, subject: str) -> None:
     Call this alongside core.paths.delete_subject_local_content() when a
     whole subject is deleted."""
     bridge_client.blob_delete_prefix(username, f"content:{subject}:")
+
+
+# ---------------------------------------------------------------------
+# Chat history (Tutor tab)
+# ---------------------------------------------------------------------
+# Stored under the same "content:<subject>:<chapter>:<category>:<filename>"
+# namespace as flashcards/guides/mock exams above, using category "chat" --
+# NOT a separate table/prefix. That's deliberate: it means
+# delete_chapter_content(), delete_subject_content() above, and
+# core.paths.wipe_local_user_data()'s "content:" prefix wipe (full account
+# deletion) all clear chat history automatically along with everything
+# else, with no separate cleanup path to remember or forget.
+_CHAT_CATEGORY = "chat"
+_CHAT_FILENAME = "history.json"
+
+
+def save_chat_messages(username: str, subject: str, chapter: str, messages: list) -> None:
+    """Persists this student's full chat message list for one chapter."""
+    save_json(username, subject, chapter, _CHAT_CATEGORY, _CHAT_FILENAME, messages)
+
+
+def load_chat_messages(username: str, subject: str, chapter: str) -> list:
+    """Returns the stored message list for one chapter, or [] if this
+    student has never chatted in it yet."""
+    data = load_json(username, subject, chapter, _CHAT_CATEGORY, _CHAT_FILENAME)
+    return data if data is not None else []
+
+
+def clear_chat_messages(username: str, subject: str, chapter: str) -> None:
+    """Wipes just the chat history for one chapter (used by the student's
+    own 'Clear this chat' control and the admin panel's per-chapter clear)."""
+    delete(username, subject, chapter, _CHAT_CATEGORY, _CHAT_FILENAME)
+
+
+def clear_all_chats_for_subject(username: str, subject: str) -> None:
+    """Wipes chat history for every chapter under one subject, without
+    touching flashcards/guides/mock exams/etc. Used by the admin panel's
+    per-subject 'clear all chats' control."""
+    prefix = f"content:{subject}:"
+    for key in bridge_client.blob_list(username, prefix):
+        if f":{_CHAT_CATEGORY}:{_CHAT_FILENAME}" in key:
+            bridge_client.blob_delete(username, key)
