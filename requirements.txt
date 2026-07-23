@@ -5,7 +5,7 @@ langchain-ollama
 langchain-text-splitters
 langgraph
 duckduckgo-search
-ddgs
+requests
 chromadb
 pypdf
 fpdf2
