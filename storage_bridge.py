@@ -652,6 +652,31 @@ def user_exists(req: UserExistsRequest, x_bridge_secret: Optional[str] = Header(
     return {"exists": row is not None}
 
 
+@app.get("/admin/users/list")
+def list_all_users(x_bridge_secret: Optional[str] = Header(None)):
+    """Returns every registered username plus basic status flags, for the
+    in-app admin panel's student picker (see ui/tab_admin.py). Gated only
+    by the shared secret like every other route in this file -- the real
+    "only Bhishma can reach this" boundary is enforced in the Streamlit
+    app layer (config.ADMIN_USERNAME check) before this is ever called,
+    the same trust model the rest of the app already relies on."""
+    _require_secret(x_bridge_secret)
+    with contextlib.closing(_get_conn()) as conn:
+        rows = conn.execute(
+            "SELECT username, subscription_status, is_disabled FROM users ORDER BY username"
+        ).fetchall()
+    return {
+        "users": [
+            {
+                "username": r["username"],
+                "subscription_status": r["subscription_status"],
+                "is_disabled": bool(r["is_disabled"]),
+            }
+            for r in rows
+        ]
+    }
+
+
 @app.get("/users/theme_color")
 def get_theme_color(username: str, x_bridge_secret: Optional[str] = Header(None)):
     """Lets the Streamlit app load the saved accent color on every login,
