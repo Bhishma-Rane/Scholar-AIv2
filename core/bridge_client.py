@@ -186,6 +186,15 @@ def user_exists(username: str) -> bool:
     return result["exists"]
 
 
+def list_all_users() -> list:
+    """Returns every registered username plus status flags (subscription_status,
+    is_disabled). Admin-only in the UI layer -- see config.ADMIN_USERNAME and
+    ui/tab_admin.py, which is the only caller. The bridge itself just trusts
+    the shared secret like every other route."""
+    result = _get("/admin/users/list")
+    return result["users"]
+
+
 def verify_password(username: str, password: str) -> bool:
     result = _post("/auth/verify_password", json={"username": username, "password": password})
     if result.get("disabled"):
