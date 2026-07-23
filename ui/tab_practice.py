@@ -7,19 +7,36 @@ section-based Question Paper (VSA/SA/LA/case-based/fill-blank/
 assertion-reason, with Practice/Test mode and a timer in Test mode).
 
 REPLACES the old split across three tabs:
-  - Batch Gen's "Mixed Interactive Quiz (JSON)" mode -> now the
-    "Generate Quiz" sub-tab here.
-  - Batch Gen's "Custom Printable Mock Exam" mode -> REMOVED ENTIRELY.
-    Question Paper is its replacement -- build_mock_exam_paper() in
-    features/mock_exams.py is no longer called from anywhere; the
-    function can stay in that file unused or be deleted, your call.
-  - Assessment tab -> now the "Take Quiz" sub-tab here (unchanged logic).
-  - Question Paper tab -> now the "Question Paper" sub-tab here. Users
-    generate their own papers on demand from this tab now -- see
-    ui/tab_question_paper.py -- rather than picking from an
-    admin-published list, so it needs active_subject/active_chapter
-    passed through in addition to username/target_language.
+- Batch Gen's "Mixed Interactive Quiz (JSON)" mode -> now the
+  "Generate Quiz" sub-tab here.
+- Batch Gen's "Custom Printable Mock Exam" mode -> REMOVED ENTIRELY.
+  Question Paper is its replacement -- build_mock_exam_paper() in
+  features/mock_exams.py is no longer called from anywhere; the
+  function can stay in that file unused or be deleted, your call.
+- Assessment tab -> now the "Take Quiz" sub-tab here (unchanged logic).
+- Question Paper tab -> now the "Question Paper" sub-tab here. Users
+  generate their own papers on demand from this tab now -- see
+  ui/tab_question_paper.py -- rather than picking from an
+  admin-published list, so it needs active_subject/active_chapter
+  passed through in addition to username/target_language.
+
+BUGFIX (this revision):
+- grade_full_quiz() now requires a `username` to actually reach the LLM
+  for subjective grading (core/llm.py's get_llm() silently returns None
+  without one). _render_quiz_results_screen() already receives
+  `username` as a parameter -- it just wasn't being passed down to
+  grade_full_quiz(). Fixed by passing username=username through.
+- The "Official answer" line under each question in the results
+  breakdown was only ever shown for non-objective (written) questions.
+  For MCQs it showed nothing at all -- the "Correct answer: C" text
+  came entirely from mock_exams.py's feedback string, which (before
+  that file's own fix) only had the letter, not the option text. Now
+  that mock_exams.py's feedback already includes the full option text
+  for wrong MCQ answers, this file additionally shows the official
+  answer line for objective questions too, for consistency with
+  written questions.
 """
+
 import streamlit as st
 
 from core.content_store import exists as content_exists, load_json, delete as delete_content
@@ -50,6 +67,7 @@ def _render_generate_quiz_subtab(username: str, active_subject: str, active_chap
                     st.rerun()
 
     num_qs = st.number_input("Number of Questions", min_value=5, max_value=50, value=5, step=5)
+
     if st.button("🚀 Generate Digital Quiz", type="primary"):
         if active_chapter == "Select Chapter":
             st.error("Select Chapter.")
@@ -73,6 +91,7 @@ def _render_generate_quiz_subtab(username: str, active_subject: str, active_chap
                     }
                 )
                 status.update(label="Complete!", state="complete", expanded=False)
+
             if "Failed" not in res["response"]:
                 st.success(res["response"])
                 st.info("Switch to the 'Take Quiz' sub-tab to start it.")
@@ -88,6 +107,7 @@ def _render_quiz_setup_screen(username: str, active_subject: str, active_chapter
             help="Deducts 25% of a question's marks for each wrong (but attempted) objective answer. "
             "Skipped questions are never penalized. Subjective answers are never penalized.",
         )
+
         if st.button("▶ Load Evaluation Engine", type="primary"):
             try:
                 quiz_data = load_json(username, active_subject, active_chapter, MCQ_CATEGORY, _quiz_filename(active_chapter))
@@ -113,15 +133,16 @@ def _render_quiz_setup_screen(username: str, active_subject: str, active_chapter
 
 def _render_quiz_question_screen():
     inject_quiz_css()
-
     q_idx = st.session_state.current_q
     quiz_data = st.session_state.quiz_data
     current_q = quiz_data[q_idx]
 
     st.progress((q_idx + 1) / len(quiz_data), text=f"Question {q_idx + 1} of {len(quiz_data)}")
+
     topic = current_q.get("topic")
     if topic:
         st.caption(f"Topic: {topic}")
+
     st.subheader(f"📍 Q{q_idx + 1}: {current_q.get('q', 'Error reading question')}")
 
     if current_q.get("type") == "objective":
@@ -149,14 +170,17 @@ def _render_quiz_question_screen():
 def _render_quiz_results_screen(username: str, active_subject: str, active_chapter: str, target_language: str):
     if st.session_state.grading_result is None:
         with st.spinner("Grading your answers... (subjective answers are AI-graded, this may take a moment)"):
+            # BUGFIX: username=username was missing here, so subjective
+            # grading inside grade_full_quiz() could never authenticate
+            # with get_llm() and always fell back to "LLM engine offline".
             result = grade_full_quiz(
                 st.session_state.quiz_data,
                 st.session_state.user_answers,
                 negative_marking=st.session_state.get("negative_marking_enabled", False),
                 lang=target_language,
+                username=username,
             )
             st.session_state.grading_result = result
-
             record_quiz_attempt(
                 username=username,
                 subject=active_subject,
@@ -177,13 +201,18 @@ def _render_quiz_results_screen(username: str, active_subject: str, active_chapt
 
     st.markdown("---")
     st.subheader("Question-by-Question Breakdown")
+
     for r in result["per_question"]:
         q = st.session_state.quiz_data[r["index"]]
         icon = "✅" if r["marks_earned"] == r["marks_possible"] else ("⚠️" if r["marks_earned"] > 0 else "❌")
         with st.expander(f"{icon} Q{r['index'] + 1}: {q.get('q', '')} — {r['marks_earned']}/{r['marks_possible']} marks"):
             st.markdown(f"**Your answer:** {st.session_state.user_answers.get(r['index']) or '*Skipped*'}")
-            if q.get("type") != "objective":
-                st.markdown(f"**Official answer:** {q.get('answer', '')}")
+            # BUGFIX: this used to only show "Official answer" for
+            # non-objective questions. MCQs now get the same treatment --
+            # mock_exams.py's feedback already carries the full
+            # "Correct answer: C) <option text>" string for wrong MCQ
+            # answers, so this line is safe to show for both types.
+            st.markdown(f"**Official answer:** {q.get('answer', '')}")
             if r.get("feedback"):
                 st.markdown(f"**Feedback:** {r['feedback']}")
 
@@ -232,6 +261,7 @@ def render_practice_tab(username: str, active_subject: str, active_chapter: str,
         label_visibility="collapsed",
         key="practice_sub_choice",
     )
+
     st.markdown("---")
 
     if sub_choice == "⚡ Generate Quiz":
