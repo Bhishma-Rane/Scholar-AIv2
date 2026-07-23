@@ -40,6 +40,13 @@ OLLAMA_BASE_URL = st.secrets.get("OLLAMA_BASE_URL", os.environ.get("OLLAMA_BASE_
 BRIDGE_BASE_URL = st.secrets.get("BRIDGE_BASE_URL", os.environ.get("BRIDGE_BASE_URL", "")).rstrip("/")
 BRIDGE_SHARED_SECRET = st.secrets.get("BRIDGE_SHARED_SECRET", os.environ.get("BRIDGE_SHARED_SECRET", ""))
 
+# The one account (in-app, not the desktop admin_gui.py) that gets the
+# "🔐 Admin" tab and can view/clear any student's chat history. Stored
+# lowercase since ui/auth.py lowercases every username on login/signup
+# before comparing/storing it. ui/auth.py's signup form also blocks new
+# accounts from registering this exact username, so it can't be squatted.
+ADMIN_USERNAME = "bhishma rane"
+
 MIN_PASSWORD_LENGTH = 8
 
 DEFAULT_THEME_COLOR = "#5a691d"  # olive green
