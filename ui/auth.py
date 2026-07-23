@@ -2,7 +2,7 @@ import time
 
 import streamlit as st
 
-from config import MIN_PASSWORD_LENGTH
+from config import MIN_PASSWORD_LENGTH, ADMIN_USERNAME
 from core.credentials import (
     create_account, user_exists, verify_password, issue_login_token,
     verify_login_token, revoke_login_token, reset_password,
@@ -150,6 +150,12 @@ def _render_signup_form():
 
         if not clean_username:
             st.error("Please choose a username.")
+            return
+
+        # Reserved for the single in-app admin account (see config.ADMIN_USERNAME)
+        # -- blocked here so nobody else can register it out from under Bhishma.
+        if clean_username == ADMIN_USERNAME:
+            st.error("That username is reserved. Please choose a different one.")
             return
 
         try:
