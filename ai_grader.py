@@ -25,7 +25,7 @@ from core.llm import get_llm
 def grade_written_answer(question: dict, user_answer: str, lang: str = "English") -> dict:
     """
     question: a paper_questions row dict, with question_text and marks set.
-        For case_based sub-questions, the caller should pass the PARENT's
+            For case_based sub-questions, the caller should pass the PARENT's
         passage as part of the prompt context (see grade_paper_attempt,
         which threads this through) so the LLM grades with full context,
         not just the sub-question in isolation.
