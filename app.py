@@ -18,7 +18,7 @@ instead of being buried in a cramped sidebar section.
 
 import streamlit as st
 
-from config import configure_page, init_session_state, inject_css, render_brand_header, DEFAULT_THEME_COLOR, ADMIN_USERNAME
+from config import configure_page, init_session_state, inject_css, DEFAULT_THEME_COLOR, ADMIN_USERNAME
 from core.paths import get_user_paths
 from core.bridge_client import get_theme_color, BridgeUnavailableError
 from ui.auth import require_login
@@ -48,7 +48,6 @@ if "theme_color" not in st.session_state or st.session_state.get("_theme_color_l
     st.session_state["_theme_color_loaded_for"] = username
 
 inject_css(st.session_state["theme_color"])
-render_brand_header()
 
 _, feedback_col = st.columns([6, 1])
 with feedback_col:
